@@ -70,12 +70,13 @@ def check_game(game_pk):
 def main():
     send_telegram("✅ Grand Slam Tracker is live.")
 
-    while True:
-        try:
-            games = get_today_games()
+while True:
+    try:
+        games = get_today_games()
+        print(f"Checking {len(games)} live games...", flush=True)
 
-            for game_pk in games:
-                check_game(game_pk)
+        for game_pk in games:
+            check_game(game_pk)
 
         except Exception as e:
             print("Error:", e)
