@@ -1,0 +1,86 @@
+import os
+import time
+import requests
+
+# CHANGE THIS IN RAILWAY VARIABLES, NOT HERE
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
+
+sent_alerts = set()
+
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+
+def get_today_games():
+    url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
+    data = requests.get(url, timeout=10).json()
+
+    games = []
+    for date_block in data.get("dates", []):
+        for game in date_block.get("games", []):
+            if game["status"]["abstractGameState"] == "Live":
+                games.append(game["gamePk"])
+
+    return games
+
+def check_game(game_pk):
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+    data = requests.get(url, timeout=10).json()
+
+    linescore = data.get("liveData", {}).get("linescore", {})
+    offense = linescore.get("offense", {})
+
+    bases_loaded = (
+        "first" in offense and
+        "second" in offense and
+        "third" in offense
+    )
+
+    if not bases_loaded:
+        return
+
+    inning = linescore.get("currentInningOrdinal", "?")
+    half = linescore.get("inningHalf", "?")
+    outs = linescore.get("outs", "?")
+
+    batter = offense.get("batter", {}).get("fullName", "Unknown batter")
+    team = offense.get("team", {}).get("name", "Unknown team")
+
+    alert_key = f"{game_pk}-{inning}-{half}-{outs}-{batter}"
+
+    if alert_key in sent_alerts:
+        return
+
+    sent_alerts.add(alert_key)
+
+    msg = (
+        f"🚨 BASES LOADED\n\n"
+        f"{team} batting\n"
+        f"{half} {inning}\n"
+        f"{outs} outs\n"
+        f"Batter: {batter}\n\n"
+        f"Grand slam spot 👀"
+    )
+
+    send_telegram(msg)
+
+def main():
+    send_telegram("✅ Grand Slam Tracker is live.")
+
+    while True:
+        try:
+            games = get_today_games()
+
+            for game_pk in games:
+                check_game(game_pk)
+
+        except Exception as e:
+            print("Error:", e)
+
+        time.sleep(POLL_SECONDS)
+
+if __name__ == "__main__":
+    main()
