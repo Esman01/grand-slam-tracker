@@ -18,9 +18,23 @@ def get_subscribers():
         return set()
 
 
+def send_telegram(chat_id, msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(
+        url,
+        data={"chat_id": chat_id, "text": msg},
+        timeout=10
+    )
+
+
+def broadcast(msg):
+    for chat_id in get_subscribers():
+        send_telegram(chat_id, msg)
+
+
 def save_subscriber(chat_id):
-    subscribers = get_subscribers()
     chat_id = str(chat_id)
+    subscribers = get_subscribers()
 
     if chat_id not in subscribers:
         with open(SUBSCRIBERS_FILE, "a") as file:
@@ -31,30 +45,26 @@ def save_subscriber(chat_id):
         send_telegram(chat_id, "✅ You’re already subscribed.")
 
 
-def send_telegram(chat_id, msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(
-        url,
-        data={
-            "chat_id": chat_id,
-            "text": msg
-        },
-        timeout=10
-    )
-
-
-def broadcast(msg):
+def remove_subscriber(chat_id):
+    chat_id = str(chat_id)
     subscribers = get_subscribers()
 
-    for chat_id in subscribers:
-        send_telegram(chat_id, msg)
+    if chat_id in subscribers:
+        subscribers.remove(chat_id)
+
+        with open(SUBSCRIBERS_FILE, "w") as file:
+            for sub in sorted(subscribers):
+                file.write(sub + "\n")
+
+        send_telegram(chat_id, "❌ You’ve been unsubscribed.")
+    else:
+        send_telegram(chat_id, "You were not subscribed.")
 
 
 def check_telegram_messages():
     global last_update_id
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-
     params = {}
 
     if last_update_id is not None:
@@ -63,7 +73,7 @@ def check_telegram_messages():
     data = requests.get(url, params=params, timeout=10).json()
 
     for update in data.get("result", []):
-        last_update_id = update["update_id"]
+        last_update_id = update.get("update_id", last_update_id)
 
         message = update.get("message", {})
         chat = message.get("chat", {})
@@ -82,22 +92,6 @@ def check_telegram_messages():
 
         elif text == "/stop":
             remove_subscriber(chat_id)
-
-
-def remove_subscriber(chat_id):
-    chat_id = str(chat_id)
-    subscribers = get_subscribers()
-
-    if chat_id in subscribers:
-        subscribers.remove(chat_id)
-
-        with open(SUBSCRIBERS_FILE, "w") as file:
-            for sub in subscribers:
-                file.write(sub + "\n")
-
-        send_telegram(chat_id, "❌ You’ve been unsubscribed.")
-    else:
-        send_telegram(chat_id, "You were not subscribed.")
 
 
 def get_today_games():
@@ -132,6 +126,13 @@ def check_game(game_pk):
     if not bases_loaded:
         return
 
+    teams = data.get("gameData", {}).get("teams", {})
+    away_team = teams.get("away", {}).get("name", "Away")
+    home_team = teams.get("home", {}).get("name", "Home")
+
+    away_runs = linescore.get("teams", {}).get("away", {}).get("runs", 0)
+    home_runs = linescore.get("teams", {}).get("home", {}).get("runs", 0)
+
     inning = linescore.get("currentInningOrdinal", "?")
     half = linescore.get("inningHalf", "?")
     outs = linescore.get("outs", "?")
@@ -139,7 +140,7 @@ def check_game(game_pk):
     batter = offense.get("batter", {}).get("fullName", "Unknown batter")
     team = offense.get("team", {}).get("name", "Unknown team")
 
-    alert_key = f"{game_pk}-{inning}-{half}-{outs}-{batter}"
+    alert_key = f"{game_pk}-{inning}-{half}-{outs}-{batter}-{away_runs}-{home_runs}"
 
     if alert_key in sent_alerts:
         return
@@ -152,6 +153,9 @@ def check_game(game_pk):
         f"{half} {inning}\n"
         f"{outs} outs\n"
         f"Batter: {batter}\n\n"
+        f"Score:\n"
+        f"{away_team}: {away_runs}\n"
+        f"{home_team}: {home_runs}\n\n"
         f"Grand slam spot 👀"
     )
 
