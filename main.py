@@ -7,14 +7,28 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 
 SUBSCRIBERS_FILE = "subscribers.txt"
 sent_alerts = set()
+last_update_id = None
 
 
 def get_subscribers():
     try:
         with open(SUBSCRIBERS_FILE, "r") as file:
-            return [line.strip() for line in file if line.strip()]
+            return set(line.strip() for line in file if line.strip())
     except FileNotFoundError:
-        return []
+        return set()
+
+
+def save_subscriber(chat_id):
+    subscribers = get_subscribers()
+    chat_id = str(chat_id)
+
+    if chat_id not in subscribers:
+        with open(SUBSCRIBERS_FILE, "a") as file:
+            file.write(chat_id + "\n")
+
+        send_telegram(chat_id, "✅ You’re subscribed to Grand Slam Tracker alerts.")
+    else:
+        send_telegram(chat_id, "✅ You’re already subscribed.")
 
 
 def send_telegram(chat_id, msg):
@@ -34,6 +48,56 @@ def broadcast(msg):
 
     for chat_id in subscribers:
         send_telegram(chat_id, msg)
+
+
+def check_telegram_messages():
+    global last_update_id
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+
+    params = {}
+
+    if last_update_id is not None:
+        params["offset"] = last_update_id + 1
+
+    data = requests.get(url, params=params, timeout=10).json()
+
+    for update in data.get("result", []):
+        last_update_id = update["update_id"]
+
+        message = update.get("message", {})
+        chat = message.get("chat", {})
+        text = message.get("text", "")
+
+        chat_id = chat.get("id")
+
+        if not chat_id:
+            continue
+
+        if text == "/start":
+            save_subscriber(chat_id)
+
+        elif text == "/status":
+            send_telegram(chat_id, "✅ Grand Slam Tracker is online and watching live MLB games.")
+
+        elif text == "/stop":
+            remove_subscriber(chat_id)
+
+
+def remove_subscriber(chat_id):
+    chat_id = str(chat_id)
+    subscribers = get_subscribers()
+
+    if chat_id in subscribers:
+        subscribers.remove(chat_id)
+
+        with open(SUBSCRIBERS_FILE, "w") as file:
+            for sub in subscribers:
+                file.write(sub + "\n")
+
+        send_telegram(chat_id, "❌ You’ve been unsubscribed.")
+    else:
+        send_telegram(chat_id, "You were not subscribed.")
 
 
 def get_today_games():
@@ -99,6 +163,8 @@ def main():
 
     while True:
         try:
+            check_telegram_messages()
+
             games = get_today_games()
             print(f"Checking {len(games)} live games...", flush=True)
 
