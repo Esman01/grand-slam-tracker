@@ -2,29 +2,40 @@ import os
 import time
 import requests
 
-# CHANGE THIS IN RAILWAY VARIABLES, NOT HERE
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 
 sent_alerts = set()
 
+
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    requests.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "text": msg
+        },
+        timeout=10
+    )
+
 
 def get_today_games():
     url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
     data = requests.get(url, timeout=10).json()
 
     games = []
+
     for date_block in data.get("dates", []):
         for game in date_block.get("games", []):
-            if game["status"]["abstractGameState"] == "Live":
-                games.append(game["gamePk"])
+            status = game.get("status", {}).get("abstractGameState")
+
+            if status == "Live":
+                games.append(game.get("gamePk"))
 
     return games
+
 
 def check_game(game_pk):
     url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
@@ -67,21 +78,24 @@ def check_game(game_pk):
 
     send_telegram(msg)
 
+
 def main():
     send_telegram("✅ Grand Slam Tracker is live.")
 
-while True:
-    try:
-        games = get_today_games()
-        print(f"Checking {len(games)} live games...", flush=True)
+    while True:
+        try:
+            games = get_today_games()
+            print(f"Checking {len(games)} live games...", flush=True)
 
-        for game_pk in games:
-            check_game(game_pk)
+            for game_pk in games:
+                if game_pk:
+                    check_game(game_pk)
 
         except Exception as e:
-            print("Error:", e)
+            print("Error:", e, flush=True)
 
         time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
     main()
