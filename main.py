@@ -3,22 +3,37 @@ import time
 import requests
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 
+SUBSCRIBERS_FILE = "subscribers.txt"
 sent_alerts = set()
 
 
-def send_telegram(msg):
+def get_subscribers():
+    try:
+        with open(SUBSCRIBERS_FILE, "r") as file:
+            return [line.strip() for line in file if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def send_telegram(chat_id, msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(
         url,
         data={
-            "chat_id": CHAT_ID,
+            "chat_id": chat_id,
             "text": msg
         },
         timeout=10
     )
+
+
+def broadcast(msg):
+    subscribers = get_subscribers()
+
+    for chat_id in subscribers:
+        send_telegram(chat_id, msg)
 
 
 def get_today_games():
@@ -76,11 +91,11 @@ def check_game(game_pk):
         f"Grand slam spot 👀"
     )
 
-    send_telegram(msg)
+    broadcast(msg)
 
 
 def main():
-    send_telegram("✅ Grand Slam Tracker is live.")
+    broadcast("✅ Grand Slam Tracker is live.")
 
     while True:
         try:
