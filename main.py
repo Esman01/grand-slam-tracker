@@ -3,62 +3,53 @@ import time
 import requests
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+SHEET_WEBHOOK_URL = os.environ["SHEET_WEBHOOK_URL"]
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 
-SUBSCRIBERS_FILE = "subscribers.txt"
 sent_alerts = set()
+active_loaded_spots = set()
 last_update_id = None
-
-
-def get_subscribers():
-    try:
-        with open(SUBSCRIBERS_FILE, "r") as file:
-            return set(line.strip() for line in file if line.strip())
-    except FileNotFoundError:
-        return set()
 
 
 def send_telegram(chat_id, msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(
-        url,
-        data={"chat_id": chat_id, "text": msg},
-        timeout=10
-    )
+    requests.post(url, data={"chat_id": chat_id, "text": msg}, timeout=10)
+
+
+def get_sheet_subscribers():
+    try:
+        response = requests.get(SHEET_WEBHOOK_URL, timeout=10)
+        data = response.json()
+        return set(str(x) for x in data.get("subscribers", []))
+    except Exception as e:
+        print("Sheet subscriber error:", e, flush=True)
+        return set()
+
+
+def save_subscriber(chat_id, username="", first_name="", status="active"):
+    payload = {
+        "chat_id": str(chat_id),
+        "username": username,
+        "first_name": first_name,
+        "status": status
+    }
+
+    try:
+        requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=10)
+        return True
+    except Exception as e:
+        print("Sheet save error:", e, flush=True)
+        return False
 
 
 def broadcast(msg):
-    for chat_id in get_subscribers():
-        send_telegram(chat_id, msg)
+    subscribers = get_sheet_subscribers()
 
-
-def save_subscriber(chat_id):
-    chat_id = str(chat_id)
-    subscribers = get_subscribers()
-
-    if chat_id not in subscribers:
-        with open(SUBSCRIBERS_FILE, "a") as file:
-            file.write(chat_id + "\n")
-
-        send_telegram(chat_id, "✅ You’re subscribed to Grand Slam Tracker alerts.")
-    else:
-        send_telegram(chat_id, "✅ You’re already subscribed.")
-
-
-def remove_subscriber(chat_id):
-    chat_id = str(chat_id)
-    subscribers = get_subscribers()
-
-    if chat_id in subscribers:
-        subscribers.remove(chat_id)
-
-        with open(SUBSCRIBERS_FILE, "w") as file:
-            for sub in sorted(subscribers):
-                file.write(sub + "\n")
-
-        send_telegram(chat_id, "❌ You’ve been unsubscribed.")
-    else:
-        send_telegram(chat_id, "You were not subscribed.")
+    for chat_id in subscribers:
+        try:
+            send_telegram(chat_id, msg)
+        except Exception as e:
+            print(f"Send error to {chat_id}:", e, flush=True)
 
 
 def check_telegram_messages():
@@ -77,21 +68,29 @@ def check_telegram_messages():
 
         message = update.get("message", {})
         chat = message.get("chat", {})
-        text = message.get("text", "")
 
         chat_id = chat.get("id")
+        username = chat.get("username", "")
+        first_name = chat.get("first_name", "")
+        text = message.get("text", "")
 
         if not chat_id:
             continue
 
         if text == "/start":
-            save_subscriber(chat_id)
+            if save_subscriber(chat_id, username, first_name, "active"):
+                send_telegram(chat_id, "✅ You’re subscribed to Grand Slam Tracker alerts.")
+            else:
+                send_telegram(chat_id, "⚠️ Subscription failed. Try again later.")
+
+        elif text == "/stop":
+            if save_subscriber(chat_id, username, first_name, "inactive"):
+                send_telegram(chat_id, "❌ You’ve been unsubscribed.")
+            else:
+                send_telegram(chat_id, "⚠️ Unsubscribe failed. Try again later.")
 
         elif text == "/status":
             send_telegram(chat_id, "✅ Grand Slam Tracker is online and watching live MLB games.")
-
-        elif text == "/stop":
-            remove_subscriber(chat_id)
 
 
 def get_today_games():
@@ -123,8 +122,9 @@ def check_game(game_pk):
         "third" in offense
     )
 
-    if not bases_loaded:
-        return
+    inning = linescore.get("currentInningOrdinal", "?")
+    half = linescore.get("inningHalf", "?")
+    outs = linescore.get("outs", "?")
 
     teams = data.get("gameData", {}).get("teams", {})
     away_team = teams.get("away", {}).get("name", "Away")
@@ -133,33 +133,50 @@ def check_game(game_pk):
     away_runs = linescore.get("teams", {}).get("away", {}).get("runs", 0)
     home_runs = linescore.get("teams", {}).get("home", {}).get("runs", 0)
 
-    inning = linescore.get("currentInningOrdinal", "?")
-    half = linescore.get("inningHalf", "?")
-    outs = linescore.get("outs", "?")
-
+    offense_team = offense.get("team", {}).get("name", "Unknown team")
     batter = offense.get("batter", {}).get("fullName", "Unknown batter")
-    team = offense.get("team", {}).get("name", "Unknown team")
 
-    alert_key = f"{game_pk}-{inning}-{half}-{outs}-{batter}-{away_runs}-{home_runs}"
+    spot_key = f"{game_pk}-{inning}-{half}"
+    score_key = f"{game_pk}-{inning}-{half}-{away_runs}-{home_runs}"
 
-    if alert_key in sent_alerts:
+    if not bases_loaded:
+        active_loaded_spots.discard(spot_key)
         return
 
-    sent_alerts.add(alert_key)
+    if spot_key not in active_loaded_spots:
+        active_loaded_spots.add(spot_key)
 
-    msg = (
-        f"🚨 BASES LOADED\n\n"
-        f"{team} batting\n"
-        f"{half} {inning}\n"
-        f"{outs} outs\n"
-        f"Batter: {batter}\n\n"
-        f"Score:\n"
-        f"{away_team}: {away_runs}\n"
-        f"{home_team}: {home_runs}\n\n"
-        f"Grand slam spot 👀"
-    )
+        msg = (
+            f"🚨 BASES LOADED\n\n"
+            f"{offense_team} batting\n"
+            f"{half} {inning}\n"
+            f"{outs} outs\n"
+            f"Batter: {batter}\n\n"
+            f"Score:\n"
+            f"{away_team}: {away_runs}\n"
+            f"{home_team}: {home_runs}\n\n"
+            f"Grand slam spot 👀"
+        )
 
-    broadcast(msg)
+        broadcast(msg)
+        sent_alerts.add(score_key)
+        return
+
+    if score_key not in sent_alerts:
+        sent_alerts.add(score_key)
+
+        msg = (
+            f"⚾ SCORE CHANGED — BASES STILL LOADED\n\n"
+            f"{offense_team} batting\n"
+            f"{half} {inning}\n"
+            f"{outs} outs\n"
+            f"Batter: {batter}\n\n"
+            f"Score:\n"
+            f"{away_team}: {away_runs}\n"
+            f"{home_team}: {home_runs}"
+        )
+
+        broadcast(msg)
 
 
 def main():
