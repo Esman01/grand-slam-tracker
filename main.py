@@ -31,12 +31,14 @@ def save_subscriber(chat_id, username="", first_name="", status="active"):
         "chat_id": str(chat_id),
         "username": username,
         "first_name": first_name,
-        "status": status
+        "status": status,
     }
 
     try:
-        requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=10)
-        return True
+        response = requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=10)
+        print("Sheet save response:", response.text, flush=True)
+        data = response.json()
+        return data.get("ok") is True
     except Exception as e:
         print("Sheet save error:", e, flush=True)
         return False
@@ -50,6 +52,21 @@ def broadcast(msg):
             send_telegram(chat_id, msg)
         except Exception as e:
             print(f"Send error to {chat_id}:", e, flush=True)
+
+
+def subscription_message():
+    return (
+        "✅ Subscription Active\n\n"
+        "You’ll receive MLB bases-loaded alerts with score updates.\n\n"
+        "Commands:\n"
+        "/status - check status\n"
+        "/stop - stop alerts\n"
+        "/join - restart alerts\n\n"
+        "⚠️ Beta Notice:\n"
+        "If alerts ever stop unexpectedly, send:\n\n"
+        "/join\n\n"
+        "That refreshes your subscription."
+    )
 
 
 def check_telegram_messages():
@@ -77,20 +94,50 @@ def check_telegram_messages():
         if not chat_id:
             continue
 
-        if text == "/start":
+        print(f"Telegram message from {chat_id}: {text}", flush=True)
+
+        if text.startswith("/start") or text.startswith("/join"):
             if save_subscriber(chat_id, username, first_name, "active"):
-                send_telegram(chat_id, "✅ You’re subscribed to Grand Slam Tracker alerts.")
+                send_telegram(chat_id, subscription_message())
             else:
-                send_telegram(chat_id, "⚠️ Subscription failed. Try again later.")
+                send_telegram(chat_id, "⚠️ Subscription failed. Send /join again.")
 
-        elif text == "/stop":
+        elif text.startswith("/stop"):
             if save_subscriber(chat_id, username, first_name, "inactive"):
-                send_telegram(chat_id, "❌ You’ve been unsubscribed.")
+                send_telegram(
+                    chat_id,
+                    "❌ Alerts stopped.\n\n"
+                    "Send /join to start receiving alerts again."
+                )
             else:
-                send_telegram(chat_id, "⚠️ Unsubscribe failed. Try again later.")
+                send_telegram(chat_id, "⚠️ Stop failed. Send /stop again.")
 
-        elif text == "/status":
-            send_telegram(chat_id, "✅ Grand Slam Tracker is online and watching live MLB games.")
+        elif text.startswith("/status"):
+            subscribers = get_sheet_subscribers()
+
+            if str(chat_id) in subscribers:
+                send_telegram(
+                    chat_id,
+                    "✅ Grand Slam Tracker is online.\n\n"
+                    "Subscription Status: ACTIVE\n\n"
+                    "If alerts ever stop unexpectedly, send:\n"
+                    "/join"
+                )
+            else:
+                send_telegram(
+                    chat_id,
+                    "⚠️ Grand Slam Tracker is online, but you are NOT active.\n\n"
+                    "Send /join to activate alerts."
+                )
+
+        else:
+            send_telegram(
+                chat_id,
+                "⚾ Grand Slam Tracker\n\n"
+                "Send /join to activate alerts.\n"
+                "Send /status to check status.\n"
+                "Send /stop to stop alerts."
+            )
 
 
 def get_today_games():
