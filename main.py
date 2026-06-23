@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from datetime import datetime, timedelta
@@ -29,6 +30,9 @@ FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 STATS_CACHE_SECONDS = int(os.getenv("STATS_CACHE_SECONDS", "900"))
 INJURY_CACHE_SECONDS = int(os.getenv("INJURY_CACHE_SECONDS", "3600"))
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", ".telegram_offset")
+RESULTS_FILE = os.getenv("RESULTS_FILE", "alert_results.json")
+RESULTS_RECAP_DAYS = int(os.getenv("RESULTS_RECAP_DAYS", "1"))
+MAX_RECAP_ITEMS = int(os.getenv("MAX_RECAP_ITEMS", "5"))
 
 RECENT_INJURY_NAMES = [
     x.strip().lower()
@@ -40,6 +44,18 @@ sent_alerts = {}
 player_stats_cache = {}
 injury_cache = {}
 last_update_id = None
+
+OUTCOME_COMMANDS = {
+    "/win": "win",
+    "/won": "win",
+    "/loss": "loss",
+    "/lost": "loss",
+    "/push": "push",
+    "/void": "push",
+    "/nomarket": "no_market",
+    "/no_market": "no_market",
+    "/locked": "no_market",
+}
 
 
 def validate_config():
@@ -145,6 +161,185 @@ def save_last_update_id(update_id):
         print("Telegram offset write error:", exc, flush=True)
 
 
+def utc_now():
+    return datetime.utcnow().replace(microsecond=0)
+
+
+def parse_iso_datetime(value):
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return datetime.min
+
+
+def load_result_store():
+    try:
+        with open(RESULTS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {"alerts": []}
+    except (OSError, json.JSONDecodeError) as exc:
+        print("Results store read error:", exc, flush=True)
+        return {"alerts": []}
+
+    if not isinstance(data, dict):
+        return {"alerts": []}
+    alerts = data.get("alerts", [])
+    if not isinstance(alerts, list):
+        alerts = []
+    data["alerts"] = alerts
+    return data
+
+
+def save_result_store(store):
+    temp_file = f"{RESULTS_FILE}.tmp"
+    try:
+        with open(temp_file, "w", encoding="utf-8") as handle:
+            json.dump(store, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temp_file, RESULTS_FILE)
+    except OSError as exc:
+        print("Results store write error:", exc, flush=True)
+
+
+def make_alert_id(game_pk, inning, half, alert_type, target_id, now=None):
+    now = now or utc_now()
+    half_code = str(half or "?")[:1].upper()
+    type_code = "".join(part[:1] for part in str(alert_type).split("_"))[:3]
+    return f"{now.strftime('%m%d')}-{game_pk}-{inning}{half_code}-{type_code}-{target_id}"
+
+
+def record_alert(alert):
+    store = load_result_store()
+    alerts = store.setdefault("alerts", [])
+    existing = next((item for item in alerts if item.get("id") == alert.get("id")), None)
+
+    if existing:
+        existing.update({
+            key: value
+            for key, value in alert.items()
+            if key not in {"status", "outcome_at", "reported_by"}
+        })
+    else:
+        alert.setdefault("status", "open")
+        alerts.append(alert)
+
+    save_result_store(store)
+
+
+def record_alert_outcome(alert_id, outcome, reported_by):
+    store = load_result_store()
+    for alert in store.get("alerts", []):
+        if str(alert.get("id")).lower() == str(alert_id).lower():
+            alert["status"] = outcome
+            alert["outcome_at"] = utc_now().isoformat()
+            alert["reported_by"] = str(reported_by)
+            save_result_store(store)
+            return alert
+    return None
+
+
+def summarize_results(days=1, now=None):
+    now = now or utc_now()
+    cutoff = now - timedelta(days=days)
+    summary = {
+        "total": 0,
+        "open": 0,
+        "win": 0,
+        "loss": 0,
+        "push": 0,
+        "no_market": 0,
+        "by_type": {},
+        "recent": [],
+    }
+
+    alerts = sorted(
+        load_result_store().get("alerts", []),
+        key=lambda item: parse_iso_datetime(item.get("sent_at")),
+        reverse=True,
+    )
+
+    for alert in alerts:
+        sent_at = parse_iso_datetime(alert.get("sent_at"))
+        if sent_at < cutoff:
+            continue
+
+        status = alert.get("status", "open")
+        alert_type = alert.get("alert_type", "UNKNOWN")
+        summary["total"] += 1
+        summary[status] = summary.get(status, 0) + 1
+        summary["by_type"][alert_type] = summary["by_type"].get(alert_type, 0) + 1
+
+        if len(summary["recent"]) < MAX_RECAP_ITEMS:
+            summary["recent"].append(alert)
+
+    return summary
+
+
+def build_results_recap(days=RESULTS_RECAP_DAYS):
+    summary = summarize_results(days)
+    graded = summary["win"] + summary["loss"]
+    win_rate = (summary["win"] / graded * 100) if graded else 0
+
+    lines = [
+        f"Results recap: last {days} day(s)",
+        "",
+        f"Tracked alerts: {summary['total']}",
+        f"Record: {summary['win']}-{summary['loss']}-{summary['push']}",
+        f"No market/locked: {summary['no_market']}",
+        f"Still open: {summary['open']}",
+        f"Win rate: {win_rate:.1f}%" if graded else "Win rate: not enough graded alerts",
+    ]
+
+    if summary["by_type"]:
+        type_lines = [
+            f"{alert_type}: {count}"
+            for alert_type, count in sorted(summary["by_type"].items())
+        ]
+        lines.extend(["", "By alert type:", "\n".join(type_lines)])
+
+    if summary["recent"]:
+        recent_lines = [
+            f"{alert['id']} | {alert.get('status', 'open')} | "
+            f"{alert.get('alert_type', 'UNKNOWN')} | {alert.get('target', alert.get('team', 'Unknown'))}"
+            for alert in summary["recent"]
+        ]
+        lines.extend(["", "Recent:", "\n".join(recent_lines)])
+
+    return "\n".join(lines)
+
+
+def build_pending_alerts(limit=MAX_RECAP_ITEMS):
+    alerts = [
+        alert
+        for alert in load_result_store().get("alerts", [])
+        if alert.get("status", "open") == "open"
+    ]
+    alerts.sort(key=lambda item: parse_iso_datetime(item.get("sent_at")), reverse=True)
+
+    if not alerts:
+        return "No open tracked alerts."
+
+    lines = ["Open tracked alerts:"]
+    for alert in alerts[:limit]:
+        lines.append(
+            f"{alert['id']} | {alert.get('alert_type', 'UNKNOWN')} | "
+            f"{alert.get('target', alert.get('team', 'Unknown'))} | "
+            f"Score {alert.get('score', '?')}"
+        )
+    lines.append("")
+    lines.append("Report with /win ID, /loss ID, /push ID, or /nomarket ID.")
+    return "\n".join(lines)
+
+
+def tracking_footer(alert_id):
+    return (
+        "\n\nTrack this alert:\n"
+        f"ID: {alert_id}\n"
+        f"Report: /win {alert_id} | /loss {alert_id} | /push {alert_id} | /nomarket {alert_id}"
+    )
+
+
 def send_telegram(chat_id, msg):
     url = f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendMessage"
     data = request_json("post", url, data={"chat_id": chat_id, "text": msg})
@@ -196,8 +391,32 @@ def subscription_message():
         "have more time before markets lock.\n\n"
         "Commands:\n"
         "/status - check status\n"
+        "/recap - show recent alert results\n"
+        "/pending - show open tracked alerts\n"
+        "/win ID, /loss ID, /push ID, /nomarket ID - report an alert result\n"
         "/stop - stop alerts\n"
         "/join - restart alerts"
+    )
+
+
+def parse_command(text):
+    parts = (text or "").strip().split()
+    if not parts:
+        return "", []
+    command = parts[0].split("@", 1)[0].lower()
+    return command, parts[1:]
+
+
+def outcome_response(alert, outcome):
+    labels = {
+        "win": "win",
+        "loss": "loss",
+        "push": "push/void",
+        "no_market": "no market/locked",
+    }
+    return (
+        f"Recorded {labels.get(outcome, outcome)} for {alert['id']}.\n\n"
+        f"{build_results_recap()}"
     )
 
 
@@ -227,23 +446,24 @@ def check_telegram_messages():
         username = chat.get("username", "")
         first_name = chat.get("first_name", "")
         text = message.get("text", "")
+        command, args = parse_command(text)
 
         if not chat_id:
             continue
 
-        if text.startswith("/start") or text.startswith("/join"):
+        if command in ["/start", "/join"]:
             if save_subscriber(chat_id, username, first_name, "active"):
                 send_telegram(chat_id, subscription_message())
             else:
                 send_telegram(chat_id, "Subscription failed. Send /join again.")
 
-        elif text.startswith("/stop"):
+        elif command == "/stop":
             if save_subscriber(chat_id, username, first_name, "inactive"):
                 send_telegram(chat_id, "Alerts stopped.\n\nSend /join to restart.")
             else:
                 send_telegram(chat_id, "Stop failed. Send /stop again.")
 
-        elif text.startswith("/status"):
+        elif command == "/status":
             subscribers = get_sheet_subscribers()
             if str(chat_id) in subscribers:
                 send_telegram(chat_id, "Bot is online.\n\nSubscription Status: ACTIVE")
@@ -253,12 +473,38 @@ def check_telegram_messages():
                     "Bot is online, but you are NOT active.\n\nSend /join.",
                 )
 
+        elif command in ["/recap", "/results"]:
+            send_telegram(chat_id, build_results_recap())
+
+        elif command == "/pending":
+            send_telegram(chat_id, build_pending_alerts())
+
+        elif command in OUTCOME_COMMANDS:
+            if not args:
+                send_telegram(
+                    chat_id,
+                    "Send the alert ID too. Example: /win 0623-12345-6T-GR-67890",
+                )
+                continue
+
+            outcome = OUTCOME_COMMANDS[command]
+            alert = record_alert_outcome(args[0], outcome, chat_id)
+            if alert:
+                send_telegram(chat_id, outcome_response(alert, outcome))
+            else:
+                send_telegram(
+                    chat_id,
+                    f"I couldn't find alert ID {args[0]}.\n\n{build_pending_alerts()}",
+                )
+
         else:
             send_telegram(
                 chat_id,
                 "MLB Betting Alert Bot\n\n"
                 "Send /join to activate alerts.\n"
                 "Send /status to check status.\n"
+                "Send /recap to see results.\n"
+                "Send /pending to see open alerts.\n"
                 "Send /stop to stop alerts.",
             )
 
@@ -1048,10 +1294,38 @@ def check_game(game_pk):
         print(f"Skipping duplicate/cooldown: {spot_key}", flush=True)
         return
 
+    alert_id = make_alert_id(
+        game_pk,
+        inning,
+        half,
+        alert_type,
+        best_target["target"]["id"],
+    )
+    record_alert({
+        "id": alert_id,
+        "sent_at": utc_now().isoformat(),
+        "game_pk": game_pk,
+        "team": team,
+        "alert_type": alert_type,
+        "target": best_target["target"]["name"],
+        "target_role": best_target["target"]["role"],
+        "target_id": best_target["target"]["id"],
+        "score": display_score(alert_score),
+        "pressure_score": display_score(pressure_score),
+        "game_spot": game_spot,
+        "base_state": base_text,
+        "markets": [
+            label
+            for _, _, label in top_player_markets(best_target)
+        ],
+        "status": "open",
+    })
+    msg = f"{msg}{tracking_footer(alert_id)}"
+
     print(
         f"Sending {alert_type}: {team} | Pitcher {pitcher_obj['name']} | "
         f"{best_target['target']['name']} ({best_target['target']['role']}) | "
-        f"score {alert_score} | pressure {pressure_score}",
+        f"score {alert_score} | pressure {pressure_score} | alert {alert_id}",
         flush=True,
     )
 
