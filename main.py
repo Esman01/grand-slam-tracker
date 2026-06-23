@@ -7,25 +7,18 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 SHEET_WEBHOOK_URL = os.environ["SHEET_WEBHOOK_URL"]
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
-ONLY_BASES_LOADED = os.getenv("ONLY_BASES_LOADED", "true").lower() == "true"
 
+ONLY_BASES_LOADED = os.getenv("ONLY_BASES_LOADED", "false").lower() == "true"
 ACTIONABLE_ONLY = os.getenv("ACTIONABLE_ONLY", "true").lower() == "true"
 ALLOW_FAST_LOCK_MARKETS = os.getenv("ALLOW_FAST_LOCK_MARKETS", "false").lower() == "true"
 
-ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "180"))
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "240"))
 MAX_ALERTS_PER_HALF_INNING = int(os.getenv("MAX_ALERTS_PER_HALF_INNING", "1"))
 
-MIN_HIT_SCORE = int(os.getenv("MIN_HIT_SCORE", "90"))
-MIN_RBI_SCORE = int(os.getenv("MIN_RBI_SCORE", "92"))
-MIN_HR_SCORE = int(os.getenv("MIN_HR_SCORE", "94"))
-MIN_K_SCORE = int(os.getenv("MIN_K_SCORE", "94"))
-MIN_TOTAL_BASES_SCORE = int(os.getenv("MIN_TOTAL_BASES_SCORE", "92"))
-MIN_XBH_SCORE = int(os.getenv("MIN_XBH_SCORE", "94"))
-MIN_TEAM_SCORE_INNING = int(os.getenv("MIN_TEAM_SCORE_INNING", "94"))
-MIN_MELTDOWN_SCORE = int(os.getenv("MIN_MELTDOWN_SCORE", "90"))
-MIN_INNING_HR_SCORE = int(os.getenv("MIN_INNING_HR_SCORE", "94"))
-MIN_LIVE_TEAM_TOTAL_SCORE = int(os.getenv("MIN_LIVE_TEAM_TOTAL_SCORE", "92"))
-MIN_GAME_TOTAL_SCORE = int(os.getenv("MIN_GAME_TOTAL_SCORE", "92"))
+MIN_GET_READY_SCORE = int(os.getenv("MIN_GET_READY_SCORE", "88"))
+MIN_MATCHUP_SCORE = int(os.getenv("MIN_MATCHUP_SCORE", "90"))
+MIN_PRESSURE_SCORE = int(os.getenv("MIN_PRESSURE_SCORE", "90"))
+MIN_LIVE_BET_SCORE = int(os.getenv("MIN_LIVE_BET_SCORE", "92"))
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 
@@ -73,17 +66,9 @@ def grade(score):
         return "🔥 ELITE"
     if shown >= 90:
         return "✅ STRONG"
-    return "PLAYABLE"
-
-
-def lock_label(risk):
-    if risk <= 20:
-        return "Low"
-    if risk <= 45:
-        return "Medium"
-    if risk <= 70:
-        return "High"
-    return "Very High"
+    if shown >= 86:
+        return "🟡 GOOD"
+    return "WATCH"
 
 
 def send_telegram(chat_id, msg):
@@ -129,16 +114,13 @@ def broadcast(msg):
 def subscription_message():
     return (
         "✅ Subscription Active\n\n"
-        "You’ll receive high-confidence MLB live bet alerts.\n\n"
-        "The bot prioritizes:\n"
-        "• Team Total Over\n"
-        "• Game Total Over\n"
-        "• Current Inning Total Runs Over\n"
-        "• Team To Score This Inning\n\n"
-        "Spam control is on:\n"
-        "• Max 1 alert per team per half-inning\n"
-        "• Cooldown between repeat spots\n"
-        "• Fast-lock player props hidden by default\n\n"
+        "You’ll receive target-based MLB live betting alerts.\n\n"
+        "Alert types:\n"
+        "🚨 LIVE BET ALERT\n"
+        "👀 GET READY ALERT\n"
+        "🔥 MATCHUP ALERT\n"
+        "⚠️ PRESSURE BUILDING\n\n"
+        "Every player market will name the exact player to check.\n\n"
         "Commands:\n"
         "/status - check status\n"
         "/stop - stop alerts\n"
@@ -314,95 +296,6 @@ def recently_reinstated_from_injury(player_id, player_name):
         return result
 
 
-def get_batter_vs_pitcher_history(batter_id, pitcher_id):
-    if not batter_id or not pitcher_id:
-        return {"score": 0, "summary": "No BvP data"}
-
-    cache_key = f"bvp-{batter_id}-{pitcher_id}"
-
-    if cache_key in player_stats_cache:
-        return player_stats_cache[cache_key]
-
-    url = (
-        f"https://statsapi.mlb.com/api/v1/people/{batter_id}"
-        f"?hydrate=stats(group=[hitting],type=[vsPlayer],opposingPlayerId={pitcher_id})"
-    )
-
-    try:
-        data = requests.get(url, timeout=10).json()
-        person = data.get("people", [{}])[0]
-        stats_blocks = person.get("stats", [])
-
-        if not stats_blocks:
-            result = {"score": 0, "summary": "No BvP data"}
-            player_stats_cache[cache_key] = result
-            return result
-
-        splits = stats_blocks[0].get("splits", [])
-
-        if not splits:
-            result = {"score": 0, "summary": "No BvP data"}
-            player_stats_cache[cache_key] = result
-            return result
-
-        stat = splits[0].get("stat", {})
-
-        at_bats = safe_int(stat.get("atBats"))
-        hits = safe_int(stat.get("hits"))
-        home_runs = safe_int(stat.get("homeRuns"))
-        strikeouts = safe_int(stat.get("strikeOuts"))
-        avg = safe_float(stat.get("avg"))
-        ops = safe_float(stat.get("ops"))
-
-        score = 0
-
-        if at_bats < 6:
-            result = {
-                "score": 0,
-                "summary": f"Tiny BvP sample: {hits}-{at_bats}, {home_runs} HR"
-            }
-            player_stats_cache[cache_key] = result
-            return result
-
-        if avg >= 0.350:
-            score += 8
-        elif avg >= 0.280:
-            score += 4
-        elif avg <= 0.180:
-            score -= 8
-
-        if ops >= 1.000:
-            score += 8
-        elif ops >= 0.850:
-            score += 4
-        elif ops <= 0.600:
-            score -= 6
-
-        if home_runs >= 2:
-            score += 10
-        elif home_runs == 1:
-            score += 5
-
-        if strikeouts >= max(3, at_bats * 0.35):
-            score -= 6
-
-        score = max(-15, min(18, score))
-
-        result = {
-            "score": score,
-            "summary": f"BvP: {hits}-{at_bats}, {home_runs} HR, AVG {avg:.3f}, OPS {ops:.3f}"
-        }
-
-        player_stats_cache[cache_key] = result
-        return result
-
-    except Exception as e:
-        print("BvP error:", e, flush=True)
-        result = {"score": 0, "summary": "BvP unavailable"}
-        player_stats_cache[cache_key] = result
-        return result
-
-
 def calculate_batter_profile(stats):
     avg = safe_float(stats.get("avg"))
     obp = safe_float(stats.get("obp"))
@@ -430,6 +323,15 @@ def calculate_batter_profile(stats):
     xbh_rate = (doubles + triples + hr) / max(at_bats, 1)
 
     hit_score = 45 + (avg * 85) + (obp * 35) - (k_rate * 45)
+
+    hrr_score = (
+        45
+        + (avg * 55)
+        + (obp * 35)
+        + (slg * 25)
+        + (bb_rate * 25)
+        - (k_rate * 35)
+    )
 
     rbi_score = (
         45
@@ -465,21 +367,19 @@ def calculate_batter_profile(stats):
         - (k_rate * 15)
     )
 
-    batter_k_risk = 40 + (k_rate * 120) - (bb_rate * 35) - (avg * 25)
-
     return {
-        "hit_score": clamp(hit_score),
-        "rbi_score": clamp(rbi_score),
-        "hr_score": clamp(hr_score),
-        "total_bases_score": clamp(total_bases_score),
-        "xbh_score": clamp(xbh_score),
-        "batter_k_risk": clamp(batter_k_risk),
+        "hit": clamp(hit_score),
+        "hrr": clamp(hrr_score),
+        "rbi": clamp(rbi_score),
+        "hr": clamp(hr_score),
+        "total_bases": clamp(total_bases_score),
+        "xbh": clamp(xbh_score),
         "avg": avg,
         "obp": obp,
         "slg": slg,
         "ops": ops,
-        "hr": hr,
-        "rbi": rbi,
+        "hr_count": hr,
+        "rbi_count": rbi,
         "k_rate": k_rate,
         "bb_rate": bb_rate,
         "pa": pa,
@@ -489,7 +389,6 @@ def calculate_batter_profile(stats):
 def calculate_pitcher_profile(stats):
     era = safe_float(stats.get("era"))
     whip = safe_float(stats.get("whip"))
-
     home_runs = safe_int(stats.get("homeRuns"))
     walks = safe_int(stats.get("baseOnBalls"))
     strikeouts = safe_int(stats.get("strikeOuts"))
@@ -503,71 +402,39 @@ def calculate_pitcher_profile(stats):
     k9 = strikeouts * 9 / ip
     h9 = hits * 9 / ip
 
-    contact_suppression = 0
-    rbi_suppression = 0
-    hr_suppression = 0
-    tb_suppression = 0
-    xbh_suppression = 0
-    strikeout_boost = 0
+    weakness = 0
 
-    if era <= 3.25:
-        contact_suppression += 8
-        rbi_suppression += 8
-        tb_suppression += 6
-    elif era >= 5.00:
-        contact_suppression -= 8
-        rbi_suppression -= 8
-        tb_suppression -= 8
+    if era >= 5.00:
+        weakness += 12
+    elif era >= 4.25:
+        weakness += 7
+    elif era <= 3.25:
+        weakness -= 10
 
-    if whip <= 1.10:
-        contact_suppression += 10
-        rbi_suppression += 10
-    elif whip >= 1.40:
-        contact_suppression -= 10
-        rbi_suppression -= 12
-
-    if k9 >= 11:
-        contact_suppression += 11
-        rbi_suppression += 7
-        hr_suppression += 4
-        tb_suppression += 7
-        strikeout_boost += 20
-    elif k9 >= 9:
-        strikeout_boost += 12
-    elif k9 <= 7:
-        contact_suppression -= 7
-        rbi_suppression -= 5
-        strikeout_boost -= 8
-
-    if hr9 <= 0.80:
-        hr_suppression += 12
-        xbh_suppression += 8
-    elif hr9 >= 1.40:
-        hr_suppression -= 14
-        xbh_suppression -= 10
-    elif hr9 >= 1.10:
-        hr_suppression -= 7
-        xbh_suppression -= 5
+    if whip >= 1.50:
+        weakness += 15
+    elif whip >= 1.35:
+        weakness += 9
+    elif whip <= 1.10:
+        weakness -= 10
 
     if bb9 >= 4.0:
-        rbi_suppression -= 10
+        weakness += 10
     elif bb9 <= 2.0:
-        rbi_suppression += 5
+        weakness -= 5
 
     if h9 >= 9.5:
-        contact_suppression -= 8
-        tb_suppression -= 7
+        weakness += 9
     elif h9 <= 7.0:
-        contact_suppression += 6
-        tb_suppression += 5
+        weakness -= 6
+
+    if hr9 >= 1.40:
+        weakness += 9
+    elif hr9 <= 0.80:
+        weakness -= 7
 
     return {
-        "contact_suppression": contact_suppression,
-        "rbi_suppression": rbi_suppression,
-        "hr_suppression": hr_suppression,
-        "tb_suppression": tb_suppression,
-        "xbh_suppression": xbh_suppression,
-        "strikeout_boost": strikeout_boost,
+        "weakness": weakness,
         "era": era,
         "whip": whip,
         "hr9": hr9,
@@ -581,41 +448,27 @@ def calculate_count_edge(balls, strikes):
     balls = safe_int(balls)
     strikes = safe_int(strikes)
 
-    edge = {"hit": 0, "rbi": 0, "hr": 0, "k": 0, "tb": 0, "xbh": 0}
-
-    if balls >= 4:
-        edge.update({"hit": 4, "rbi": 12, "hr": 1, "k": -20, "tb": 2, "xbh": 1})
-    elif balls == 3 and strikes == 0:
-        edge.update({"hit": 5, "rbi": 14, "hr": 3, "k": -18, "tb": 4, "xbh": 2})
-    elif balls == 3 and strikes == 1:
-        edge.update({"hit": 6, "rbi": 12, "hr": 5, "k": -10, "tb": 5, "xbh": 4})
-    elif balls == 3 and strikes == 2:
-        edge.update({"hit": 2, "rbi": 8, "hr": 1, "k": 8, "tb": 1, "xbh": 0})
-    elif balls == 2 and strikes == 0:
-        edge.update({"hit": 6, "rbi": 7, "hr": 5, "k": -10, "tb": 5, "xbh": 4})
-    elif balls == 2 and strikes == 1:
-        edge.update({"hit": 4, "rbi": 5, "hr": 3, "k": -2, "tb": 3, "xbh": 2})
-    elif balls == 0 and strikes == 2:
-        edge.update({"hit": -12, "rbi": -10, "hr": -8, "k": 20, "tb": -10, "xbh": -8})
-    elif balls == 1 and strikes == 2:
-        edge.update({"hit": -8, "rbi": -7, "hr": -5, "k": 15, "tb": -6, "xbh": -5})
-    elif balls == 0 and strikes == 1:
-        edge.update({"hit": -4, "rbi": -3, "hr": -2, "k": 5, "tb": -3, "xbh": -2})
-
-    return edge
+    if balls >= 3 and strikes <= 1:
+        return 8
+    if balls == 3 and strikes == 2:
+        return 3
+    if balls == 2 and strikes == 0:
+        return 7
+    if strikes == 2 and balls <= 1:
+        return -8
+    return 0
 
 
 def calculate_outs_edge(outs):
     outs = safe_int(outs)
 
     if outs == 0:
-        return {"hit": 2, "rbi": 8, "hr": 1, "k": 0, "team": 10}
+        return 8
     if outs == 1:
-        return {"hit": 1, "rbi": 5, "hr": 0, "k": 0, "team": 6}
+        return 5
     if outs == 2:
-        return {"hit": 0, "rbi": -3, "hr": 1, "k": 1, "team": -6}
-
-    return {"hit": 0, "rbi": 0, "hr": 0, "k": 0, "team": 0}
+        return -5
+    return 0
 
 
 def event_is_runner_reached(event):
@@ -627,17 +480,11 @@ def event_is_runner_reached(event):
 
 
 def event_is_hit(event):
-    event = (event or "").lower()
-    return event in ["single", "double", "triple", "home_run"]
+    return (event or "").lower() in ["single", "double", "triple", "home_run"]
 
 
 def event_is_walk(event):
-    event = (event or "").lower()
-    return event in ["walk", "intent_walk"]
-
-
-def event_is_hr(event):
-    return (event or "").lower() == "home_run"
+    return (event or "").lower() in ["walk", "intent_walk"]
 
 
 def get_inning_pressure(data, inning, half):
@@ -647,10 +494,8 @@ def get_inning_pressure(data, inning, half):
     walks = 0
     hbp = 0
     runs = 0
-    home_runs = 0
     consecutive_reached = 0
     max_consecutive_reached = 0
-    strikeouts = 0
 
     for play in plays:
         about = play.get("about", {})
@@ -671,10 +516,6 @@ def get_inning_pressure(data, inning, half):
             walks += 1
         if event == "hit_by_pitch":
             hbp += 1
-        if event_is_hr(event):
-            home_runs += 1
-        if event == "strikeout":
-            strikeouts += 1
 
         runs += rbi
 
@@ -689,309 +530,207 @@ def get_inning_pressure(data, inning, half):
         "walks": walks,
         "hbp": hbp,
         "runs": runs,
-        "home_runs": home_runs,
-        "strikeouts": strikeouts,
         "consecutive_reached": max_consecutive_reached,
     }
 
 
-def calculate_meltdown_score(pitcher, inning_pressure, bases_loaded, outs):
-    score = 35
+def runners_summary(offense):
+    bases = []
+    if "first" in offense:
+        bases.append("1st")
+    if "second" in offense:
+        bases.append("2nd")
+    if "third" in offense:
+        bases.append("3rd")
 
-    if pitcher["whip"] >= 1.60:
-        score += 18
-    elif pitcher["whip"] >= 1.40:
-        score += 12
-    elif pitcher["whip"] <= 1.10:
-        score -= 10
-
-    if pitcher["bb9"] >= 4.5:
-        score += 14
-    elif pitcher["bb9"] >= 3.5:
-        score += 8
-
-    if pitcher["h9"] >= 10:
-        score += 12
-    elif pitcher["h9"] >= 9:
-        score += 7
-
-    score += inning_pressure["hits"] * 8
-    score += inning_pressure["walks"] * 10
-    score += inning_pressure["hbp"] * 8
-    score += inning_pressure["runs"] * 5
-    score += inning_pressure["consecutive_reached"] * 7
-
-    if bases_loaded:
-        score += 16
-
-    if safe_int(outs) == 0:
-        score += 8
-    elif safe_int(outs) == 1:
-        score += 4
-    elif safe_int(outs) == 2:
-        score -= 5
-
-    return clamp(score)
+    if len(bases) == 3:
+        return "Bases loaded"
+    if not bases:
+        return "Bases empty"
+    return "Runner on " + "/".join(bases)
 
 
-def calculate_game_context_score(away_runs, home_runs, inning, bases_loaded):
-    diff = abs(safe_int(away_runs) - safe_int(home_runs))
-    inn = safe_int(inning)
-
+def runner_score(offense):
     score = 0
 
-    if diff == 0:
+    if "first" in offense:
+        score += 3
+    if "second" in offense:
+        score += 8
+    if "third" in offense:
         score += 10
-    elif diff <= 2:
-        score += 6
-    elif diff >= 6:
-        score -= 8
 
-    if inn >= 7:
-        score += 5
-
-    if bases_loaded:
-        score += 5
+    if "first" in offense and "second" in offense and "third" in offense:
+        score += 12
 
     return score
 
 
-def calculate_scores(
-    batter_stats,
-    pitcher_stats,
-    bvp,
-    balls,
-    strikes,
-    outs,
-    bases_loaded,
-    inning_pressure,
-    away_runs,
-    home_runs,
-    inning,
-):
-    batter = calculate_batter_profile(batter_stats)
-    pitcher = calculate_pitcher_profile(pitcher_stats)
-    count = calculate_count_edge(balls, strikes)
-    outs_edge = calculate_outs_edge(outs)
-    context = calculate_game_context_score(away_runs, home_runs, inning, bases_loaded)
+def calculate_pressure_score(offense, pitcher, inning_pressure, outs, inning):
+    pressure = 35
+    pressure += runner_score(offense)
+    pressure += pitcher["weakness"]
+    pressure += inning_pressure["hits"] * 6
+    pressure += inning_pressure["walks"] * 8
+    pressure += inning_pressure["hbp"] * 8
+    pressure += inning_pressure["consecutive_reached"] * 7
+    pressure += calculate_outs_edge(outs)
 
-    meltdown = calculate_meltdown_score(pitcher, inning_pressure, bases_loaded, outs)
+    inn = safe_int(inning)
+    if 2 <= inn <= 6:
+        pressure += 8
+    elif inn >= 8:
+        pressure -= 7
 
-    hit_score = batter["hit_score"] - pitcher["contact_suppression"] + bvp["score"] + count["hit"] + outs_edge["hit"]
-    rbi_score = batter["rbi_score"] - pitcher["rbi_suppression"] + bvp["score"] + count["rbi"] + outs_edge["rbi"] + (10 if bases_loaded else 0)
-    hr_score = batter["hr_score"] - pitcher["hr_suppression"] + bvp["score"] + count["hr"] + outs_edge["hr"]
-    k_score = batter["batter_k_risk"] + pitcher["strikeout_boost"] - bvp["score"] + count["k"] + outs_edge["k"]
-    total_bases_score = batter["total_bases_score"] - pitcher["tb_suppression"] + bvp["score"] + count["tb"]
-    xbh_score = batter["xbh_score"] - pitcher["xbh_suppression"] + bvp["score"] + count["xbh"]
-
-    team_score_inning = (
-        45 + meltdown * 0.45 + outs_edge["team"] + (18 if bases_loaded else 0)
-        + inning_pressure["hits"] * 5 + inning_pressure["walks"] * 7 + context
-    )
-
-    live_team_total_over = (
-        48 + meltdown * 0.42 + inning_pressure["hits"] * 4 + inning_pressure["walks"] * 5
-        + (10 if bases_loaded else 0) + context
-    )
-
-    game_total_over = (
-        50 + meltdown * 0.30 + inning_pressure["runs"] * 5 + inning_pressure["hits"] * 3
-        + inning_pressure["walks"] * 4 + (7 if bases_loaded else 0) + context
-    )
-
-    inning_total_runs = (
-        42 + meltdown * 0.48 + inning_pressure["hits"] * 6 + inning_pressure["walks"] * 8
-        + (20 if bases_loaded else 0) + outs_edge["team"]
-    )
-
-    inning_hr_score = (
-        hr_score * 0.70
-        + max(0, 75 - safe_int(outs) * 8) * 0.15
-        + max(0, pitcher["hr9"] * 10) * 0.15
-    )
-
-    return {
-        "hit": clamp(hit_score),
-        "rbi": clamp(rbi_score),
-        "hr": clamp(hr_score),
-        "k": clamp(k_score),
-        "total_bases": clamp(total_bases_score),
-        "xbh": clamp(xbh_score),
-        "team_score_inning": clamp(team_score_inning),
-        "live_team_total_over": clamp(live_team_total_over),
-        "game_total_over": clamp(game_total_over),
-        "inning_total_runs": clamp(inning_total_runs),
-        "meltdown": clamp(meltdown),
-        "inning_hr": clamp(inning_hr_score),
-        "batter": batter,
-        "pitcher": pitcher,
-        "bvp": bvp,
-        "inning_pressure": inning_pressure,
-        "context": context,
-    }
+    return clamp(pressure)
 
 
-def market_path(bet_type, team_name):
-    paths = {
-        "LIVE TEAM TOTAL OVER": (
-            "Hits and Runs → Team Total Runs\n"
-            f"or Hits and Runs → {team_name} Alt. Total Runs"
-        ),
-        "GAME TOTAL OVER": "Live SGP → Game Lines → Total → Over",
-        "TEAM SCORE THIS INNING": (
-            "Innings → Inning Total Runs\n"
-            "or Live Specials → Team To Score This Inning"
-        ),
-        "INNING TOTAL RUNS": (
-            "Innings → Inning Total Runs\n"
-            "or Innings → All Innings O/U 0.5 Runs"
-        ),
-        "PITCHER MELTDOWN": (
-            "Hits and Runs → Team Total Runs\n"
-            f"or Hits and Runs → {team_name} Alt. Total Runs\n"
-            "Fallback: Live SGP → Game Lines → Total → Over"
-        ),
-        "HIT": "Live Player Props → Player Hits",
-        "RBI": "Live Player Props → Player RBIs",
-        "HOME RUN": "Live Player Props → Player Home Runs",
-        "TOTAL BASES": "Live Player Props → Player Total Bases",
-        "EXTRA BASE HIT": "Live Specials → 1+ Extra Base Hit",
-        "STRIKEOUT": "Batter Up SGP → PA Result → Strikeout",
-        "1+ HR THIS INNING": "Live Specials → 1+ Home Run",
-    }
+def get_batting_order(data):
+    boxscore = data.get("liveData", {}).get("boxscore", {})
+    linescore = data.get("liveData", {}).get("linescore", {})
+    offense_team_id = linescore.get("offense", {}).get("team", {}).get("id")
 
-    return paths.get(bet_type, "Check Live SGP, Hits and Runs, or Live Player Props")
+    teams = boxscore.get("teams", {})
 
+    for side in ["away", "home"]:
+        team = teams.get(side, {})
+        team_id = team.get("team", {}).get("id")
 
-def market_name(bet_type):
-    names = {
-        "LIVE TEAM TOTAL OVER": "Team Total Over",
-        "GAME TOTAL OVER": "Game Total Over",
-        "TEAM SCORE THIS INNING": "Team To Score This Inning",
-        "INNING TOTAL RUNS": "Inning Total Runs Over",
-        "PITCHER MELTDOWN": "Team Total Over / Game Total Over",
-        "HIT": "Player Hit",
-        "RBI": "Player RBI",
-        "HOME RUN": "Player Home Run",
-        "TOTAL BASES": "Player Total Bases Over",
-        "EXTRA BASE HIT": "Player Extra Base Hit",
-        "STRIKEOUT": "Batter Strikeout",
-        "1+ HR THIS INNING": "1+ Home Run This Inning",
-    }
+        if team_id != offense_team_id:
+            continue
 
-    return names.get(bet_type, bet_type)
+        batting_order_ids = team.get("battingOrder", [])
+        players = team.get("players", {})
 
-
-def lock_risk(bet_type):
-    risks = {
-        "GAME TOTAL OVER": 10,
-        "LIVE TEAM TOTAL OVER": 15,
-        "PITCHER MELTDOWN": 20,
-        "INNING TOTAL RUNS": 35,
-        "TEAM SCORE THIS INNING": 50,
-        "1+ HR THIS INNING": 65,
-        "TOTAL BASES": 75,
-        "EXTRA BASE HIT": 78,
-        "HIT": 80,
-        "RBI": 82,
-        "HOME RUN": 85,
-        "STRIKEOUT": 90,
-    }
-    return risks.get(bet_type, 70)
-
-
-def is_actionable_market(bet_type):
-    if not ACTIONABLE_ONLY:
-        return True
-
-    safer = [
-        "GAME TOTAL OVER",
-        "LIVE TEAM TOTAL OVER",
-        "PITCHER MELTDOWN",
-        "INNING TOTAL RUNS",
-        "TEAM SCORE THIS INNING",
-    ]
-
-    if bet_type in safer:
-        return True
-
-    if ALLOW_FAST_LOCK_MARKETS:
-        return True
-
-    return False
-
-
-def choose_bets(batter_name, offense_team, scores, bases_loaded):
-    bets = []
-
-    candidates = [
-        ("LIVE TEAM TOTAL OVER", scores["live_team_total_over"], f"{offense_team} Team Total Over", "Best match for this pressure spot. More directly tied to this team scoring."),
-        ("GAME TOTAL OVER", scores["game_total_over"], "Game Total Over", "Usually the easiest live market to find."),
-        ("PITCHER MELTDOWN", scores["meltdown"], f"{offense_team} Team Total Over", "Pitcher is losing control. Use team total first, game total if needed."),
-        ("INNING TOTAL RUNS", scores["inning_total_runs"], "Current Inning Total Runs Over", "Good if the inning market is open."),
-        ("TEAM SCORE THIS INNING", scores["team_score_inning"], f"{offense_team} To Score This Inning", "Strong spot, but this market can lock quickly."),
-        ("RBI", scores["rbi"], f"{batter_name} RBI", "Fast-lock player prop. Only playable if still visible."),
-        ("HIT", scores["hit"], f"{batter_name} Hit", "Fast-lock player prop."),
-        ("TOTAL BASES", scores["total_bases"], f"{batter_name} Total Bases Over", "Fast-lock player prop."),
-        ("EXTRA BASE HIT", scores["xbh"], f"{batter_name} Extra Base Hit", "Fast-lock player prop."),
-        ("HOME RUN", scores["hr"], f"{batter_name} Home Run", "Lottery market."),
-        ("1+ HR THIS INNING", scores["inning_hr"], "1+ Home Run This Inning", "Often locks during the current plate appearance."),
-        ("STRIKEOUT", scores["k"], f"{batter_name} Strikeout", "Fastest-lock market."),
-    ]
-
-    thresholds = {
-        "LIVE TEAM TOTAL OVER": MIN_LIVE_TEAM_TOTAL_SCORE,
-        "GAME TOTAL OVER": MIN_GAME_TOTAL_SCORE,
-        "PITCHER MELTDOWN": MIN_MELTDOWN_SCORE,
-        "INNING TOTAL RUNS": MIN_TEAM_SCORE_INNING,
-        "TEAM SCORE THIS INNING": MIN_TEAM_SCORE_INNING,
-        "RBI": MIN_RBI_SCORE if bases_loaded else 999,
-        "HIT": MIN_HIT_SCORE,
-        "TOTAL BASES": MIN_TOTAL_BASES_SCORE,
-        "EXTRA BASE HIT": MIN_XBH_SCORE,
-        "HOME RUN": MIN_HR_SCORE,
-        "1+ HR THIS INNING": MIN_INNING_HR_SCORE,
-        "STRIKEOUT": MIN_K_SCORE,
-    }
-
-    for bet_type, score, bet_text, note in candidates:
-        if score >= thresholds.get(bet_type, 999) and is_actionable_market(bet_type):
-            bets.append({
-                "type": bet_type,
-                "score": score,
-                "bet": bet_text,
-                "action_note": note,
+        ordered = []
+        for pid in batting_order_ids:
+            pdata = players.get(f"ID{pid}", {})
+            person = pdata.get("person", {})
+            ordered.append({
+                "id": person.get("id"),
+                "name": person.get("fullName", "Unknown"),
             })
 
-    priority = {
-        "LIVE TEAM TOTAL OVER": 1,
-        "PITCHER MELTDOWN": 2,
-        "GAME TOTAL OVER": 3,
-        "INNING TOTAL RUNS": 4,
-        "TEAM SCORE THIS INNING": 5,
-        "RBI": 6,
-        "HIT": 7,
-        "TOTAL BASES": 8,
-        "EXTRA BASE HIT": 9,
-        "HOME RUN": 10,
-        "1+ HR THIS INNING": 11,
-        "STRIKEOUT": 12,
+        return ordered
+
+    return []
+
+
+def get_targets(data):
+    linescore = data.get("liveData", {}).get("linescore", {})
+    offense = linescore.get("offense", {})
+
+    current = {
+        "role": "At Bat",
+        "id": offense.get("batter", {}).get("id"),
+        "name": offense.get("batter", {}).get("fullName", "Unknown batter"),
     }
 
-    bets.sort(key=lambda x: (priority.get(x["type"], 99), lock_risk(x["type"]), -x["score"]))
-    return bets[:2]
+    on_deck = {
+        "role": "On Deck",
+        "id": offense.get("onDeck", {}).get("id"),
+        "name": offense.get("onDeck", {}).get("fullName", "Unknown"),
+    }
+
+    in_hole = {
+        "role": "In Hole",
+        "id": offense.get("inHole", {}).get("id"),
+        "name": offense.get("inHole", {}).get("fullName", "Unknown"),
+    }
+
+    return [current, on_deck, in_hole]
 
 
-def should_send_alert(spot_key, best_score):
+def score_player_target(target, pitcher, pressure_score, count_edge, role):
+    stats = get_player_season_stats(target["id"], "hitting")
+    profile = calculate_batter_profile(stats)
+
+    role_boost = 0
+    if role == "At Bat":
+        role_boost = 2
+    elif role == "On Deck":
+        role_boost = 8
+    elif role == "In Hole":
+        role_boost = 5
+
+    hit_market = clamp(profile["hit"] + pitcher["weakness"] * 0.55 + pressure_score * 0.20 + role_boost + count_edge)
+    hrr_market = clamp(profile["hrr"] + pitcher["weakness"] * 0.55 + pressure_score * 0.25 + role_boost)
+    rbi_market = clamp(profile["rbi"] + pitcher["weakness"] * 0.60 + pressure_score * 0.30 + role_boost)
+    tb_market = clamp(profile["total_bases"] + pitcher["weakness"] * 0.55 + pressure_score * 0.20 + role_boost)
+    hr_market = clamp(profile["hr"] + pitcher["weakness"] * 0.45 + pressure_score * 0.12 + role_boost)
+
+    return {
+        "target": target,
+        "profile": profile,
+        "hit": hit_market,
+        "hrr": hrr_market,
+        "rbi": rbi_market,
+        "total_bases": tb_market,
+        "hr": hr_market,
+        "best_score": max(hit_market, hrr_market, rbi_market, tb_market, hr_market),
+    }
+
+
+def market_path(market, player_name=None, team_name=None):
+    if market == "Player Hits":
+        return "Live Player Props → Player Hits"
+    if market == "Player H+R+RBI":
+        return "Live Player Props → Player Hits+Runs+RBIs"
+    if market == "Player RBI":
+        return "Live Player Props → Player RBIs"
+    if market == "Player Total Bases":
+        return "Live Player Props → Player Total Bases"
+    if market == "Player Home Run":
+        return "Live Player Props → Player Home Runs"
+    if market == "Team Total Over":
+        return f"Hits and Runs → {team_name} Alt. Total Runs\nor Hits and Runs → Team Total Runs"
+    if market == "Inning Total Runs":
+        return "Innings → Inning Total Runs\nor Innings → All Innings O/U 0.5 Runs"
+    if market == "Team To Score This Inning":
+        return "Innings → Inning Total Runs\nor Live Specials → Team To Score This Inning"
+    if market == "Game Total Over":
+        return "Live SGP → Game Lines → Total → Over"
+    return "Check Live Player Props, Hits and Runs, or Innings"
+
+
+def top_player_markets(player_score):
+    name = player_score["target"]["name"]
+
+    markets = [
+        ("Player H+R+RBI", player_score["hrr"], f"{name} Hits+Runs+RBIs"),
+        ("Player Hits", player_score["hit"], f"{name} 1+ Hit"),
+        ("Player Total Bases", player_score["total_bases"], f"{name} Total Bases Over"),
+        ("Player RBI", player_score["rbi"], f"{name} RBI"),
+        ("Player Home Run", player_score["hr"], f"{name} Home Run"),
+    ]
+
+    markets.sort(key=lambda x: x[1], reverse=True)
+    return markets[:3]
+
+
+def build_market_lines(markets, team_name=None):
+    lines = []
+
+    for idx, (market, score, label) in enumerate(markets, start=1):
+        lines.append(
+            f"{idx}. {label}\n"
+            f"   Market: {market}\n"
+            f"   Find it: {market_path(market, team_name=team_name)}\n"
+            f"   Score: {display_score(score)}/100 {grade(score)}"
+        )
+
+    return "\n\n".join(lines)
+
+
+def should_send_alert(key, score):
     now = time.time()
-
-    info = sent_alerts.get(spot_key)
+    info = sent_alerts.get(key)
 
     if not info:
-        sent_alerts[spot_key] = {
+        sent_alerts[key] = {
             "count": 1,
             "last_time": now,
-            "best_score": best_score,
+            "best_score": score,
         }
         return True
 
@@ -1001,13 +740,200 @@ def should_send_alert(spot_key, best_score):
     if now - info["last_time"] < ALERT_COOLDOWN_SECONDS:
         return False
 
-    if best_score < info["best_score"] + 5:
+    if score < info["best_score"] + 5:
         return False
 
     info["count"] += 1
     info["last_time"] = now
-    info["best_score"] = best_score
+    info["best_score"] = score
     return True
+
+
+def build_get_ready_alert(team, target_score, pressure_score, game_spot, base_text, inning_pressure):
+    target = target_score["target"]
+    markets = top_player_markets(target_score)
+
+    return (
+        f"👀 GET READY ALERT\n\n"
+        f"Target Player:\n"
+        f"{target['name']} ({target['role']})\n\n"
+        f"Markets To Check:\n"
+        f"{build_market_lines(markets, team_name=team)}\n\n"
+        f"Team Fallback:\n"
+        f"{team} Team Total Over\n"
+        f"Find it: {market_path('Team Total Over', team_name=team)}\n"
+        f"Pressure Score: {display_score(pressure_score)}/100 {grade(pressure_score)}\n\n"
+        f"Game Spot:\n"
+        f"{team} batting\n"
+        f"{game_spot}\n"
+        f"{base_text}\n\n"
+        f"Why:\n"
+        f"• Target is due up soon, so player props are more likely to still be open\n"
+        f"• Pressure is building before the book fully locks markets\n"
+        f"• This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
+        f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached"
+    )
+
+
+def build_matchup_alert(team, target_score, pitcher, game_spot):
+    target = target_score["target"]
+    markets = top_player_markets(target_score)
+
+    return (
+        f"🔥 MATCHUP ALERT\n\n"
+        f"Target Player:\n"
+        f"{target['name']} ({target['role']})\n\n"
+        f"Markets To Check:\n"
+        f"{build_market_lines(markets, team_name=team)}\n\n"
+        f"Pitcher Weakness:\n"
+        f"{pitcher['weakness']} model points\n"
+        f"ERA/WHIP: {pitcher['era']:.2f}/{pitcher['whip']:.2f}\n"
+        f"HR/9: {pitcher['hr9']:.2f} | BB/9: {pitcher['bb9']:.2f}\n\n"
+        f"Game Spot:\n"
+        f"{team} batting\n"
+        f"{game_spot}"
+    )
+
+
+def build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pressure):
+    return (
+        f"⚠️ PRESSURE BUILDING\n\n"
+        f"Target Team:\n"
+        f"{team}\n\n"
+        f"Markets To Check:\n"
+        f"1. {team} Team Total Over\n"
+        f"   Find it: {market_path('Team Total Over', team_name=team)}\n\n"
+        f"2. Current Inning Total Runs Over\n"
+        f"   Find it: {market_path('Inning Total Runs')}\n\n"
+        f"3. Game Total Over\n"
+        f"   Find it: {market_path('Game Total Over')}\n\n"
+        f"Pressure Score: {display_score(pressure_score)}/100 {grade(pressure_score)}\n\n"
+        f"Game Spot:\n"
+        f"{team} batting\n"
+        f"{game_spot}\n"
+        f"{base_text}\n\n"
+        f"Why:\n"
+        f"• Pitcher/team pressure is rising\n"
+        f"• Better to check broader markets before the obvious player props lock\n"
+        f"• This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
+        f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached"
+    )
+
+
+def check_game(game_pk):
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+
+    try:
+        data = requests.get(url, timeout=10).json()
+    except Exception as e:
+        print(f"Game feed error {game_pk}:", e, flush=True)
+        return
+
+    linescore = data.get("liveData", {}).get("linescore", {})
+    offense = linescore.get("offense", {})
+
+    if not offense:
+        return
+
+    inning = linescore.get("currentInning", "?")
+    inning_display = linescore.get("currentInningOrdinal", "?")
+    half = linescore.get("inningHalf", "?").lower()
+    half_display = linescore.get("inningHalf", "?")
+    outs = linescore.get("outs", "?")
+
+    bases_loaded = "first" in offense and "second" in offense and "third" in offense
+
+    if ONLY_BASES_LOADED and not bases_loaded:
+        return
+
+    count = data.get("liveData", {}).get("plays", {}).get("currentPlay", {}).get("count", {})
+    balls = safe_int(count.get("balls"))
+    strikes = safe_int(count.get("strikes"))
+
+    team = offense.get("team", {}).get("name", "Unknown team")
+
+    pitcher_obj = get_current_pitcher(data)
+    pitcher_stats = get_player_season_stats(pitcher_obj["id"], "pitching")
+    pitcher = calculate_pitcher_profile(pitcher_stats)
+
+    inning_pressure = get_inning_pressure(data, inning, half)
+    pressure_score = calculate_pressure_score(offense, pitcher, inning_pressure, outs, inning)
+
+    targets = get_targets(data)
+
+    scored_targets = []
+    for target in targets:
+        if not target["id"] or target["name"] == "Unknown":
+            continue
+
+        injured, injury_reason = recently_reinstated_from_injury(target["id"], target["name"])
+        if injured:
+            print(f"Skipping {target['name']}: injury risk - {injury_reason}", flush=True)
+            continue
+
+        scored = score_player_target(
+            target=target,
+            pitcher=pitcher,
+            pressure_score=pressure_score,
+            count_edge=calculate_count_edge(balls, strikes) if target["role"] == "At Bat" else 0,
+            role=target["role"],
+        )
+        scored_targets.append(scored)
+
+    if not scored_targets:
+        return
+
+    scored_targets.sort(key=lambda x: x["best_score"], reverse=True)
+    best_target = scored_targets[0]
+
+    game_spot = f"{half_display} {inning_display} | {outs} outs | Count {balls}-{strikes}"
+    base_text = runners_summary(offense)
+
+    alert_type = None
+    alert_score = 0
+    msg = None
+
+    # Predictive alerts first: on-deck/in-hole before market lock.
+    future_targets = [x for x in scored_targets if x["target"]["role"] in ["On Deck", "In Hole"]]
+    future_targets.sort(key=lambda x: x["best_score"], reverse=True)
+
+    if future_targets and future_targets[0]["best_score"] >= MIN_GET_READY_SCORE and pressure_score >= 70:
+        target = future_targets[0]
+        alert_type = "GET_READY"
+        alert_score = target["best_score"]
+        msg = build_get_ready_alert(team, target, pressure_score, game_spot, base_text, inning_pressure)
+
+    elif best_target["best_score"] >= MIN_MATCHUP_SCORE and pressure_score >= 55:
+        alert_type = "MATCHUP"
+        alert_score = best_target["best_score"]
+        msg = build_matchup_alert(team, best_target, pitcher, game_spot)
+
+    elif pressure_score >= MIN_PRESSURE_SCORE:
+        alert_type = "PRESSURE"
+        alert_score = pressure_score
+        msg = build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pressure)
+
+    if not msg:
+        print(
+            f"{team} {game_spot} | Pressure {pressure_score} | "
+            f"Best {best_target['target']['name']} {best_target['best_score']} | no alert",
+            flush=True
+        )
+        return
+
+    spot_key = f"{game_pk}-{inning}-{half}-{team}-{alert_type}"
+
+    if not should_send_alert(spot_key, alert_score):
+        print(f"Skipping duplicate/cooldown: {spot_key}", flush=True)
+        return
+
+    print(
+        f"Sending {alert_type}: {team} | {best_target['target']['name']} | "
+        f"score {alert_score} | pressure {pressure_score}",
+        flush=True
+    )
+
+    broadcast(msg)
 
 
 def get_current_pitcher(data):
@@ -1029,202 +955,8 @@ def get_current_pitcher(data):
     return {"id": None, "name": "Unknown pitcher"}
 
 
-def get_current_count(data):
-    current_play = data.get("liveData", {}).get("plays", {}).get("currentPlay", {})
-    count = current_play.get("count", {})
-
-    return {
-        "balls": safe_int(count.get("balls")),
-        "strikes": safe_int(count.get("strikes")),
-    }
-
-
-def build_alert_message(
-    bet,
-    all_bets,
-    offense_team,
-    half,
-    inning,
-    outs,
-    balls,
-    strikes,
-    away_team,
-    home_team,
-    away_runs,
-    home_runs,
-    scores,
-    bases_loaded,
-):
-    bvp = scores["bvp"]
-    pressure = scores["inning_pressure"]
-
-    risk = lock_risk(bet["type"])
-
-    backup = ""
-
-    if len(all_bets) > 1:
-        second = all_bets[1]
-        backup = (
-            f"\nBackup:\n"
-            f"{second['bet']}\n"
-            f"Market: {market_name(second['type'])}\n"
-            f"Find it:\n{market_path(second['type'], offense_team)}\n"
-            f"Model Score: {display_score(second['score'])}/100 {grade(second['score'])}\n"
-            f"Lock Risk: {lock_label(lock_risk(second['type']))}\n"
-        )
-
-    situation = "Bases loaded" if bases_loaded else "Live pressure spot"
-
-    return (
-        f"🚨 ACTIONABLE LIVE BET\n\n"
-        f"Primary:\n"
-        f"{bet['bet']}\n\n"
-        f"Market: {market_name(bet['type'])}\n"
-        f"Find it:\n{market_path(bet['type'], offense_team)}\n\n"
-        f"Model Score: {display_score(bet['score'])}/100 {grade(bet['score'])}\n"
-        f"Lock Risk: {lock_label(risk)}\n"
-        f"Note: {bet['action_note']}\n"
-        f"{backup}\n"
-        f"Game Spot:\n"
-        f"{offense_team} batting\n"
-        f"{half} {inning} | {outs} outs | Count {balls}-{strikes}\n\n"
-        f"Relevant Scores:\n"
-        f"Team Total: {display_score(scores['live_team_total_over'])}/100\n"
-        f"Game Total: {display_score(scores['game_total_over'])}/100\n"
-        f"Inning Total: {display_score(scores['inning_total_runs'])}/100\n"
-        f"Meltdown: {display_score(scores['meltdown'])}/100\n\n"
-        f"Why:\n"
-        f"• {situation}\n"
-        f"• {bvp['summary']}\n"
-        f"• This inning: {pressure['hits']} hit(s), {pressure['walks']} walk(s), "
-        f"{pressure['runs']} run(s), {pressure['consecutive_reached']} straight reached\n\n"
-        f"Score:\n"
-        f"{away_team}: {away_runs}\n"
-        f"{home_team}: {home_runs}\n\n"
-        f"Time: {datetime.now().strftime('%I:%M:%S %p')}"
-    )
-
-
-def check_game(game_pk):
-    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
-
-    try:
-        data = requests.get(url, timeout=10).json()
-    except Exception as e:
-        print(f"Game feed error {game_pk}:", e, flush=True)
-        return
-
-    linescore = data.get("liveData", {}).get("linescore", {})
-    offense = linescore.get("offense", {})
-
-    bases_loaded = (
-        "first" in offense
-        and "second" in offense
-        and "third" in offense
-    )
-
-    if ONLY_BASES_LOADED and not bases_loaded:
-        return
-
-    inning = linescore.get("currentInning", "?")
-    inning_display = linescore.get("currentInningOrdinal", "?")
-    half = linescore.get("inningHalf", "?").lower()
-    half_display = linescore.get("inningHalf", "?")
-    outs = linescore.get("outs", "?")
-
-    teams = data.get("gameData", {}).get("teams", {})
-    away_team = teams.get("away", {}).get("name", "Away")
-    home_team = teams.get("home", {}).get("name", "Home")
-
-    away_runs = linescore.get("teams", {}).get("away", {}).get("runs", 0)
-    home_runs = linescore.get("teams", {}).get("home", {}).get("runs", 0)
-
-    offense_team = offense.get("team", {}).get("name", "Unknown team")
-
-    batter_obj = offense.get("batter", {})
-    batter_id = batter_obj.get("id")
-    batter_name = batter_obj.get("fullName", "Unknown batter")
-
-    pitcher_obj = get_current_pitcher(data)
-    pitcher_id = pitcher_obj.get("id")
-
-    count = get_current_count(data)
-    balls = count["balls"]
-    strikes = count["strikes"]
-
-    injured, injury_reason = recently_reinstated_from_injury(batter_id, batter_name)
-
-    if injured:
-        print(f"Skipping {batter_name}: fresh injury risk - {injury_reason}", flush=True)
-        return
-
-    batter_stats = get_player_season_stats(batter_id, "hitting")
-    pitcher_stats = get_player_season_stats(pitcher_id, "pitching")
-    bvp = get_batter_vs_pitcher_history(batter_id, pitcher_id)
-    inning_pressure = get_inning_pressure(data, inning, half)
-
-    scores = calculate_scores(
-        batter_stats=batter_stats,
-        pitcher_stats=pitcher_stats,
-        bvp=bvp,
-        balls=balls,
-        strikes=strikes,
-        outs=outs,
-        bases_loaded=bases_loaded,
-        inning_pressure=inning_pressure,
-        away_runs=away_runs,
-        home_runs=home_runs,
-        inning=inning,
-    )
-
-    bets = choose_bets(
-        batter_name=batter_name,
-        offense_team=offense_team,
-        scores=scores,
-        bases_loaded=bases_loaded,
-    )
-
-    print(
-        f"{batter_name} | "
-        f"TEAM_TOTAL {scores['live_team_total_over']} GAME_TOTAL {scores['game_total_over']} "
-        f"INNING_TOTAL {scores['inning_total_runs']} TEAM_INNING {scores['team_score_inning']} "
-        f"MELT {scores['meltdown']} RBI {scores['rbi']} HIT {scores['hit']} HR {scores['hr']} | "
-        f"BETS {bets}",
-        flush=True
-    )
-
-    if not bets:
-        return
-
-    best_score = bets[0]["score"]
-    spot_key = f"{game_pk}-{inning}-{half}-{offense_team}"
-
-    if not should_send_alert(spot_key, best_score):
-        print(f"Skipping duplicate/cooldown alert for {spot_key}", flush=True)
-        return
-
-    msg = build_alert_message(
-        bet=bets[0],
-        all_bets=bets,
-        offense_team=offense_team,
-        half=half_display,
-        inning=inning_display,
-        outs=outs,
-        balls=balls,
-        strikes=strikes,
-        away_team=away_team,
-        home_team=home_team,
-        away_runs=away_runs,
-        home_runs=home_runs,
-        scores=scores,
-        bases_loaded=bases_loaded,
-    )
-
-    broadcast(msg)
-
-
 def main():
-    broadcast("✅ MLB Actionable Betting Alert Bot is live.")
+    broadcast("✅ MLB Predictive Betting Alert Bot is live.")
 
     while True:
         try:
