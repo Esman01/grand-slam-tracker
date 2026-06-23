@@ -10,6 +10,7 @@ Grand Slam Tracker is a Telegram worker that watches live MLB games and sends pr
 4. Fetches each live game's feed.
 5. Scores upcoming hitters and inning pressure.
 6. Sends `GET_READY`, `MATCHUP`, or `PRESSURE` alerts to active subscribers.
+7. Records each sent alert with a tracking ID so users can report the result.
 
 ## Environment variables
 
@@ -35,6 +36,23 @@ Optional:
 - `INJURY_CACHE_SECONDS`: Injury cache TTL. Default: `3600`.
 - `RECENT_INJURY_NAMES`: Comma-separated manual skip list.
 - `TELEGRAM_OFFSET_FILE`: File used to persist Telegram polling offset. Default: `.telegram_offset`.
+- `RESULTS_FILE`: JSON file used to persist alert results. Default: `alert_results.json`.
+- `RESULTS_RECAP_DAYS`: Lookback window for `/recap`. Default: `1`.
+- `MAX_RECAP_ITEMS`: Number of recent/open alerts shown in recaps. Default: `5`.
+
+## Telegram commands
+
+- `/join`: Start alerts.
+- `/stop`: Stop alerts.
+- `/status`: Check subscription status.
+- `/pending`: Show open tracked alerts.
+- `/recap`: Show recent performance.
+- `/win ID`: Mark an alert as a win.
+- `/loss ID`: Mark an alert as a loss.
+- `/push ID`: Mark an alert as a push/void.
+- `/nomarket ID`: Mark an alert as unavailable or locked.
+
+Each alert includes its own tracking ID and example report commands.
 
 ## Local setup
 
@@ -69,4 +87,4 @@ Configure the required environment variables on the hosting platform before star
 python -m unittest
 ```
 
-The tests cover score helpers, cache expiry, alert throttling, batting-order targeting, and current pitcher detection.
+The tests cover score helpers, cache expiry, alert throttling, batting-order targeting, current pitcher detection, and result tracking.
