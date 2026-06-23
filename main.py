@@ -8,15 +8,20 @@ SHEET_WEBHOOK_URL = os.environ["SHEET_WEBHOOK_URL"]
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 
+ONLY_BASES_LOADED = os.getenv("ONLY_BASES_LOADED", "true").lower() == "true"
+
 MIN_HIT_SCORE = int(os.getenv("MIN_HIT_SCORE", "82"))
 MIN_RBI_SCORE = int(os.getenv("MIN_RBI_SCORE", "86"))
 MIN_HR_SCORE = int(os.getenv("MIN_HR_SCORE", "88"))
 MIN_K_SCORE = int(os.getenv("MIN_K_SCORE", "88"))
+MIN_TOTAL_BASES_SCORE = int(os.getenv("MIN_TOTAL_BASES_SCORE", "85"))
+MIN_XBH_SCORE = int(os.getenv("MIN_XBH_SCORE", "88"))
+MIN_TEAM_SCORE_INNING = int(os.getenv("MIN_TEAM_SCORE_INNING", "88"))
+MIN_MELTDOWN_SCORE = int(os.getenv("MIN_MELTDOWN_SCORE", "85"))
+MIN_INNING_HR_SCORE = int(os.getenv("MIN_INNING_HR_SCORE", "90"))
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 
-# Optional manual safety list:
-# RECENT_INJURY_NAMES="Mike Trout,Aaron Judge"
 RECENT_INJURY_NAMES = [
     x.strip().lower()
     for x in os.getenv("RECENT_INJURY_NAMES", "").split(",")
@@ -56,7 +61,9 @@ def grade(score):
         return "🔥 ELITE"
     if score >= 88:
         return "✅ STRONG"
-    return "PLAYABLE"
+    if score >= 82:
+        return "🟡 PLAYABLE"
+    return "PASS"
 
 
 def send_telegram(chat_id, msg):
@@ -103,14 +110,16 @@ def subscription_message():
     return (
         "✅ Subscription Active\n\n"
         "You’ll receive strong MLB live bet alerts.\n\n"
-        "The bot looks for:\n"
-        "• Batter Hit spots\n"
-        "• Batter RBI spots\n"
-        "• Batter HR spots\n"
-        "• Strikeout spots\n"
-        "• Batter vs pitcher matchup edge\n"
-        "• Bases loaded leverage\n"
-        "• Recent injury risk\n\n"
+        "Possible alerts:\n"
+        "• Player To Record A Hit\n"
+        "• Player To Record An RBI\n"
+        "• Player To Hit A Home Run\n"
+        "• Player Total Bases\n"
+        "• Player Extra Base Hit\n"
+        "• Batter Strikeout\n"
+        "• Team To Score This Inning\n"
+        "• Pitcher Meltdown\n"
+        "• 1+ Home Run This Inning\n\n"
         "Commands:\n"
         "/status - check status\n"
         "/stop - stop alerts\n"
@@ -237,13 +246,6 @@ def get_player_season_stats(player_id, group):
 
 
 def recently_reinstated_from_injury(player_id, player_name):
-    """
-    Safety filter:
-    - Skips player if manually listed in RECENT_INJURY_NAMES.
-    - Tries MLB transactions endpoint for recent injury reinstatements.
-    - If endpoint fails, does NOT block the player.
-    """
-
     if not player_id:
         return False, "No player id"
 
@@ -269,14 +271,6 @@ def recently_reinstated_from_injury(player_id, player_name):
         data = requests.get(url, timeout=10).json()
         transactions = data.get("transactions", [])
 
-        injury_words = [
-            "injured list",
-            "injury list",
-            "il",
-            "reinstated",
-            "activated",
-        ]
-
         for tx in transactions:
             desc = (
                 tx.get("description", "")
@@ -284,11 +278,12 @@ def recently_reinstated_from_injury(player_id, player_name):
                 or tx.get("typeCode", "")
             ).lower()
 
-            if "reinstated" in desc or "activated" in desc:
-                if any(word in desc for word in injury_words):
-                    result = True, desc[:120]
-                    injury_cache[cache_key] = result
-                    return result
+            if ("reinstated" in desc or "activated" in desc) and (
+                "injured" in desc or "injury" in desc or " il" in desc
+            ):
+                result = True, desc[:120]
+                injury_cache[cache_key] = result
+                return result
 
         result = False, "No recent injury return found"
         injury_cache[cache_key] = result
@@ -395,6 +390,7 @@ def calculate_batter_profile(stats):
     obp = safe_float(stats.get("obp"))
     slg = safe_float(stats.get("slg"))
     ops = safe_float(stats.get("ops"))
+
     hr = safe_int(stats.get("homeRuns"))
     rbi = safe_int(stats.get("rbi"))
     hits = safe_int(stats.get("hits"))
@@ -410,12 +406,10 @@ def calculate_batter_profile(stats):
 
     pa = max(plate_appearances, 1)
 
-    hit_rate = hits / max(at_bats, 1)
     hr_rate = hr / pa
     bb_rate = walks / pa
     k_rate = strikeouts / pa
     xbh_rate = (doubles + triples + hr) / max(at_bats, 1)
-    rbi_rate = rbi / pa
 
     hit_score = 45 + (avg * 85) + (obp * 35) - (k_rate * 45)
 
@@ -423,7 +417,7 @@ def calculate_batter_profile(stats):
         45
         + (obp * 25)
         + (slg * 42)
-        + (rbi_rate * 110)
+        + ((rbi / pa) * 110)
         + (bb_rate * 25)
         - (k_rate * 30)
     )
@@ -437,12 +431,30 @@ def calculate_batter_profile(stats):
         - (k_rate * 15)
     )
 
+    total_bases_score = (
+        42
+        + (slg * 55)
+        + (ops * 18)
+        + (xbh_rate * 90)
+        - (k_rate * 22)
+    )
+
+    xbh_score = (
+        35
+        + (slg * 45)
+        + (xbh_rate * 140)
+        + (hr_rate * 300)
+        - (k_rate * 15)
+    )
+
     batter_k_risk = 40 + (k_rate * 120) - (bb_rate * 35) - (avg * 25)
 
     return {
         "hit_score": clamp(hit_score),
         "rbi_score": clamp(rbi_score),
         "hr_score": clamp(hr_score),
+        "total_bases_score": clamp(total_bases_score),
+        "xbh_score": clamp(xbh_score),
         "batter_k_risk": clamp(batter_k_risk),
         "avg": avg,
         "obp": obp,
@@ -459,6 +471,7 @@ def calculate_batter_profile(stats):
 def calculate_pitcher_profile(stats):
     era = safe_float(stats.get("era"))
     whip = safe_float(stats.get("whip"))
+
     home_runs = safe_int(stats.get("homeRuns"))
     walks = safe_int(stats.get("baseOnBalls"))
     strikeouts = safe_int(stats.get("strikeOuts"))
@@ -475,14 +488,18 @@ def calculate_pitcher_profile(stats):
     contact_suppression = 0
     rbi_suppression = 0
     hr_suppression = 0
+    tb_suppression = 0
+    xbh_suppression = 0
     strikeout_boost = 0
 
     if era <= 3.25:
         contact_suppression += 8
         rbi_suppression += 8
+        tb_suppression += 6
     elif era >= 5.00:
         contact_suppression -= 8
         rbi_suppression -= 8
+        tb_suppression -= 8
 
     if whip <= 1.10:
         contact_suppression += 10
@@ -495,6 +512,7 @@ def calculate_pitcher_profile(stats):
         contact_suppression += 11
         rbi_suppression += 7
         hr_suppression += 4
+        tb_suppression += 7
         strikeout_boost += 20
     elif k9 >= 9:
         strikeout_boost += 12
@@ -505,10 +523,13 @@ def calculate_pitcher_profile(stats):
 
     if hr9 <= 0.80:
         hr_suppression += 12
+        xbh_suppression += 8
     elif hr9 >= 1.40:
         hr_suppression -= 14
+        xbh_suppression -= 10
     elif hr9 >= 1.10:
         hr_suppression -= 7
+        xbh_suppression -= 5
 
     if bb9 >= 4.0:
         rbi_suppression -= 10
@@ -517,13 +538,17 @@ def calculate_pitcher_profile(stats):
 
     if h9 >= 9.5:
         contact_suppression -= 8
+        tb_suppression -= 7
     elif h9 <= 7.0:
         contact_suppression += 6
+        tb_suppression += 5
 
     return {
         "contact_suppression": contact_suppression,
         "rbi_suppression": rbi_suppression,
         "hr_suppression": hr_suppression,
+        "tb_suppression": tb_suppression,
+        "xbh_suppression": xbh_suppression,
         "strikeout_boost": strikeout_boost,
         "era": era,
         "whip": whip,
@@ -538,60 +563,24 @@ def calculate_count_edge(balls, strikes):
     balls = safe_int(balls)
     strikes = safe_int(strikes)
 
-    edge = {
-        "hit": 0,
-        "rbi": 0,
-        "hr": 0,
-        "k": 0,
-    }
+    edge = {"hit": 0, "rbi": 0, "hr": 0, "k": 0, "tb": 0, "xbh": 0}
 
     if balls == 3 and strikes == 0:
-        edge["hit"] += 5
-        edge["rbi"] += 14
-        edge["hr"] += 3
-        edge["k"] -= 18
-
+        edge.update({"hit": 5, "rbi": 14, "hr": 3, "k": -18, "tb": 4, "xbh": 2})
     elif balls == 3 and strikes == 1:
-        edge["hit"] += 6
-        edge["rbi"] += 12
-        edge["hr"] += 5
-        edge["k"] -= 10
-
+        edge.update({"hit": 6, "rbi": 12, "hr": 5, "k": -10, "tb": 5, "xbh": 4})
     elif balls == 3 and strikes == 2:
-        edge["hit"] += 2
-        edge["rbi"] += 8
-        edge["hr"] += 1
-        edge["k"] += 8
-
+        edge.update({"hit": 2, "rbi": 8, "hr": 1, "k": 8, "tb": 1, "xbh": 0})
     elif balls == 2 and strikes == 0:
-        edge["hit"] += 6
-        edge["rbi"] += 7
-        edge["hr"] += 5
-        edge["k"] -= 10
-
+        edge.update({"hit": 6, "rbi": 7, "hr": 5, "k": -10, "tb": 5, "xbh": 4})
     elif balls == 2 and strikes == 1:
-        edge["hit"] += 4
-        edge["rbi"] += 5
-        edge["hr"] += 3
-        edge["k"] -= 2
-
+        edge.update({"hit": 4, "rbi": 5, "hr": 3, "k": -2, "tb": 3, "xbh": 2})
     elif balls == 0 and strikes == 2:
-        edge["hit"] -= 12
-        edge["rbi"] -= 10
-        edge["hr"] -= 8
-        edge["k"] += 20
-
+        edge.update({"hit": -12, "rbi": -10, "hr": -8, "k": 20, "tb": -10, "xbh": -8})
     elif balls == 1 and strikes == 2:
-        edge["hit"] -= 8
-        edge["rbi"] -= 7
-        edge["hr"] -= 5
-        edge["k"] += 15
-
+        edge.update({"hit": -8, "rbi": -7, "hr": -5, "k": 15, "tb": -6, "xbh": -5})
     elif balls == 0 and strikes == 1:
-        edge["hit"] -= 4
-        edge["rbi"] -= 3
-        edge["hr"] -= 2
-        edge["k"] += 5
+        edge.update({"hit": -4, "rbi": -3, "hr": -2, "k": 5, "tb": -3, "xbh": -2})
 
     return edge
 
@@ -600,20 +589,149 @@ def calculate_outs_edge(outs):
     outs = safe_int(outs)
 
     if outs == 0:
-        return {"hit": 2, "rbi": 8, "hr": 1, "k": 0}
+        return {"hit": 2, "rbi": 8, "hr": 1, "k": 0, "team": 10}
     if outs == 1:
-        return {"hit": 1, "rbi": 5, "hr": 0, "k": 0}
+        return {"hit": 1, "rbi": 5, "hr": 0, "k": 0, "team": 6}
     if outs == 2:
-        return {"hit": 0, "rbi": -3, "hr": 1, "k": 1}
+        return {"hit": 0, "rbi": -3, "hr": 1, "k": 1, "team": -6}
 
-    return {"hit": 0, "rbi": 0, "hr": 0, "k": 0}
+    return {"hit": 0, "rbi": 0, "hr": 0, "k": 0, "team": 0}
 
 
-def calculate_scores(batter_stats, pitcher_stats, bvp, balls, strikes, outs, bases_loaded):
+def event_is_runner_reached(event):
+    event = (event or "").lower()
+    return event in [
+        "single",
+        "double",
+        "triple",
+        "home_run",
+        "walk",
+        "hit_by_pitch",
+        "field_error",
+        "catcher_interf",
+        "intent_walk",
+    ]
+
+
+def event_is_hit(event):
+    event = (event or "").lower()
+    return event in ["single", "double", "triple", "home_run"]
+
+
+def event_is_walk(event):
+    event = (event or "").lower()
+    return event in ["walk", "intent_walk"]
+
+
+def event_is_hr(event):
+    return (event or "").lower() == "home_run"
+
+
+def get_inning_pressure(data, inning, half):
+    plays = data.get("liveData", {}).get("plays", {}).get("allPlays", [])
+
+    hits = 0
+    walks = 0
+    hbp = 0
+    runs = 0
+    home_runs = 0
+    consecutive_reached = 0
+    max_consecutive_reached = 0
+    strikeouts = 0
+
+    for play in plays:
+        about = play.get("about", {})
+        result = play.get("result", {})
+
+        if safe_int(about.get("inning")) != safe_int(inning):
+            continue
+
+        if about.get("halfInning", "").lower() != str(half).lower():
+            continue
+
+        event = result.get("eventType", "")
+        rbi = safe_int(result.get("rbi"))
+
+        if event_is_hit(event):
+            hits += 1
+
+        if event_is_walk(event):
+            walks += 1
+
+        if event == "hit_by_pitch":
+            hbp += 1
+
+        if event_is_hr(event):
+            home_runs += 1
+
+        if event == "strikeout":
+            strikeouts += 1
+
+        runs += rbi
+
+        if event_is_runner_reached(event):
+            consecutive_reached += 1
+            max_consecutive_reached = max(max_consecutive_reached, consecutive_reached)
+        else:
+            consecutive_reached = 0
+
+    return {
+        "hits": hits,
+        "walks": walks,
+        "hbp": hbp,
+        "runs": runs,
+        "home_runs": home_runs,
+        "strikeouts": strikeouts,
+        "consecutive_reached": max_consecutive_reached,
+    }
+
+
+def calculate_meltdown_score(pitcher, inning_pressure, bases_loaded, outs):
+    score = 35
+
+    if pitcher["whip"] >= 1.60:
+        score += 18
+    elif pitcher["whip"] >= 1.40:
+        score += 12
+    elif pitcher["whip"] <= 1.10:
+        score -= 10
+
+    if pitcher["bb9"] >= 4.5:
+        score += 14
+    elif pitcher["bb9"] >= 3.5:
+        score += 8
+
+    if pitcher["h9"] >= 10:
+        score += 12
+    elif pitcher["h9"] >= 9:
+        score += 7
+
+    score += inning_pressure["hits"] * 8
+    score += inning_pressure["walks"] * 10
+    score += inning_pressure["hbp"] * 8
+    score += inning_pressure["runs"] * 5
+    score += inning_pressure["consecutive_reached"] * 7
+
+    if bases_loaded:
+        score += 16
+
+    if safe_int(outs) == 0:
+        score += 8
+    elif safe_int(outs) == 1:
+        score += 4
+    elif safe_int(outs) == 2:
+        score -= 5
+
+    return clamp(score)
+
+
+def calculate_scores(batter_stats, pitcher_stats, bvp, balls, strikes, outs, bases_loaded, inning_pressure):
     batter = calculate_batter_profile(batter_stats)
     pitcher = calculate_pitcher_profile(pitcher_stats)
     count = calculate_count_edge(balls, strikes)
     outs_edge = calculate_outs_edge(outs)
+
+    meltdown = calculate_meltdown_score(pitcher, inning_pressure, bases_loaded, outs)
 
     bases_rbi_boost = 10 if bases_loaded else 0
 
@@ -632,6 +750,7 @@ def calculate_scores(batter_stats, pitcher_stats, bvp, balls, strikes, outs, bas
         + count["rbi"]
         + outs_edge["rbi"]
         + bases_rbi_boost
+        + ((meltdown - 70) * 0.25 if meltdown > 70 else 0)
     )
 
     hr_score = (
@@ -650,26 +769,84 @@ def calculate_scores(batter_stats, pitcher_stats, bvp, balls, strikes, outs, bas
         + outs_edge["k"]
     )
 
+    total_bases_score = (
+        batter["total_bases_score"]
+        - pitcher["tb_suppression"]
+        + bvp["score"]
+        + count["tb"]
+    )
+
+    xbh_score = (
+        batter["xbh_score"]
+        - pitcher["xbh_suppression"]
+        + bvp["score"]
+        + count["xbh"]
+    )
+
+    team_score_inning = (
+        45
+        + meltdown * 0.45
+        + outs_edge["team"]
+        + (18 if bases_loaded else 0)
+        + inning_pressure["hits"] * 5
+        + inning_pressure["walks"] * 7
+    )
+
+    inning_hr_score = (
+        hr_score * 0.70
+        + max(0, 75 - safe_int(outs) * 8) * 0.15
+        + max(0, pitcher["hr9"] * 10) * 0.15
+    )
+
     return {
         "hit": clamp(hit_score),
         "rbi": clamp(rbi_score),
         "hr": clamp(hr_score),
         "k": clamp(k_score),
+        "total_bases": clamp(total_bases_score),
+        "xbh": clamp(xbh_score),
+        "team_score_inning": clamp(team_score_inning),
+        "meltdown": clamp(meltdown),
+        "inning_hr": clamp(inning_hr_score),
         "batter": batter,
         "pitcher": pitcher,
         "bvp": bvp,
+        "inning_pressure": inning_pressure,
     }
 
 
-def choose_bets(batter_name, scores, bases_loaded):
+def sportsbook_name(bet_type):
+    names = {
+        "HIT": "Player To Record A Hit / To Get A Hit",
+        "RBI": "Player To Record An RBI / Player RBI",
+        "HOME RUN": "Player To Hit A Home Run / Batter Home Run",
+        "STRIKEOUT": "Batter Strikeout / PA Result: Strikeout",
+        "TOTAL BASES": "Player Total Bases / Over 1.5 Total Bases",
+        "EXTRA BASE HIT": "Player To Record An Extra Base Hit",
+        "TEAM SCORE THIS INNING": "Team To Score This Inning / Team Runs This Inning",
+        "PITCHER MELTDOWN": "Team To Score This Inning / Live Team Total Over / Inning Runs Over",
+        "1+ HR THIS INNING": "1+ Home Run This Inning / Home Run In Inning",
+    }
+    return names.get(bet_type, bet_type)
+
+
+def choose_bets(batter_name, offense_team, scores, bases_loaded):
     bets = []
 
-    if scores["hit"] >= MIN_HIT_SCORE:
+    if scores["team_score_inning"] >= MIN_TEAM_SCORE_INNING:
         bets.append({
-            "type": "HIT",
-            "player": batter_name,
-            "score": scores["hit"],
-            "bet": f"{batter_name} Hit"
+            "type": "TEAM SCORE THIS INNING",
+            "player": offense_team,
+            "score": scores["team_score_inning"],
+            "bet": f"{offense_team} To Score This Inning",
+        })
+
+    if scores["meltdown"] >= MIN_MELTDOWN_SCORE:
+        bets.append({
+            "type": "PITCHER MELTDOWN",
+            "player": offense_team,
+            "score": scores["meltdown"],
+            "bet": f"{offense_team} To Score This Inning or Live Team Total Over",
         })
 
     if bases_loaded and scores["rbi"] >= MIN_RBI_SCORE:
@@ -677,7 +854,31 @@ def choose_bets(batter_name, scores, bases_loaded):
             "type": "RBI",
             "player": batter_name,
             "score": scores["rbi"],
-            "bet": f"{batter_name} RBI"
+            "bet": f"{batter_name} RBI",
+        })
+
+    if scores["hit"] >= MIN_HIT_SCORE:
+        bets.append({
+            "type": "HIT",
+            "player": batter_name,
+            "score": scores["hit"],
+            "bet": f"{batter_name} Hit",
+        })
+
+    if scores["total_bases"] >= MIN_TOTAL_BASES_SCORE:
+        bets.append({
+            "type": "TOTAL BASES",
+            "player": batter_name,
+            "score": scores["total_bases"],
+            "bet": f"{batter_name} Over Total Bases",
+        })
+
+    if scores["xbh"] >= MIN_XBH_SCORE:
+        bets.append({
+            "type": "EXTRA BASE HIT",
+            "player": batter_name,
+            "score": scores["xbh"],
+            "bet": f"{batter_name} Extra Base Hit",
         })
 
     if scores["hr"] >= MIN_HR_SCORE:
@@ -685,7 +886,15 @@ def choose_bets(batter_name, scores, bases_loaded):
             "type": "HOME RUN",
             "player": batter_name,
             "score": scores["hr"],
-            "bet": f"{batter_name} Home Run"
+            "bet": f"{batter_name} Home Run",
+        })
+
+    if scores["inning_hr"] >= MIN_INNING_HR_SCORE:
+        bets.append({
+            "type": "1+ HR THIS INNING",
+            "player": offense_team,
+            "score": scores["inning_hr"],
+            "bet": f"1+ Home Run This Inning",
         })
 
     if scores["k"] >= MIN_K_SCORE:
@@ -693,7 +902,7 @@ def choose_bets(batter_name, scores, bases_loaded):
             "type": "STRIKEOUT",
             "player": batter_name,
             "score": scores["k"],
-            "bet": f"{batter_name} Strikeout"
+            "bet": f"{batter_name} Strikeout",
         })
 
     bets.sort(key=lambda x: x["score"], reverse=True)
@@ -747,14 +956,16 @@ def build_alert_message(
 ):
     bvp = scores["bvp"]
     batter = scores["batter"]
+    pressure = scores["inning_pressure"]
 
     secondary = ""
 
     if len(all_bets) > 1:
-        secondary_bet = all_bets[1]
+        second = all_bets[1]
         secondary = (
-            f"\nSecondary: {secondary_bet['bet']} "
-            f"({secondary_bet['score']}/100 {grade(secondary_bet['score'])})\n"
+            f"\nSecondary Bet: {second['bet']}\n"
+            f"Sportsbook Name: {sportsbook_name(second['type'])}\n"
+            f"Confidence: {second['score']}/100 {grade(second['score'])}\n"
         )
 
     situation = "Bases loaded" if bases_loaded else "Live matchup"
@@ -762,20 +973,27 @@ def build_alert_message(
     return (
         f"🚨 BET ALERT\n\n"
         f"Bet: {bet['bet']}\n"
+        f"Sportsbook Name: {sportsbook_name(bet['type'])}\n"
         f"Confidence: {bet['score']}/100 {grade(bet['score'])}\n"
         f"{secondary}\n"
+        f"Game Spot:\n"
         f"{offense_team} batting\n"
         f"{half} {inning} | {outs} outs | Count {balls}-{strikes}\n\n"
         f"Scores:\n"
         f"Hit: {scores['hit']}/100\n"
         f"RBI: {scores['rbi']}/100\n"
         f"HR: {scores['hr']}/100\n"
-        f"K: {scores['k']}/100\n\n"
+        f"Total Bases: {scores['total_bases']}/100\n"
+        f"Extra Base Hit: {scores['xbh']}/100\n"
+        f"Strikeout: {scores['k']}/100\n"
+        f"Team Scores Inning: {scores['team_score_inning']}/100\n"
+        f"Meltdown: {scores['meltdown']}/100\n\n"
         f"Why:\n"
         f"• {situation}\n"
         f"• Batter AVG/OBP/SLG: {batter['avg']:.3f}/{batter['obp']:.3f}/{batter['slg']:.3f}\n"
-        f"• Batter HR: {batter['hr']} | RBI: {batter['rbi']}\n"
-        f"• {bvp['summary']}\n\n"
+        f"• {bvp['summary']}\n"
+        f"• This inning: {pressure['hits']} hits, {pressure['walks']} walks, "
+        f"{pressure['runs']} runs, {pressure['consecutive_reached']} straight reached\n\n"
         f"Score:\n"
         f"{away_team}: {away_runs}\n"
         f"{home_team}: {home_runs}\n\n"
@@ -801,13 +1019,13 @@ def check_game(game_pk):
         and "third" in offense
     )
 
-    # For now, only fire betting alerts during bases-loaded leverage.
-    # Change this to False if you want every strong live matchup.
-    if not bases_loaded:
+    if ONLY_BASES_LOADED and not bases_loaded:
         return
 
-    inning = linescore.get("currentInningOrdinal", "?")
-    half = linescore.get("inningHalf", "?")
+    inning = linescore.get("currentInning", "?")
+    inning_display = linescore.get("currentInningOrdinal", "?")
+    half = linescore.get("inningHalf", "?").lower()
+    half_display = linescore.get("inningHalf", "?")
     outs = linescore.get("outs", "?")
 
     teams = data.get("gameData", {}).get("teams", {})
@@ -838,16 +1056,14 @@ def check_game(game_pk):
     injured, injury_reason = recently_reinstated_from_injury(batter_id, batter_name)
 
     if injured:
-        print(
-            f"Skipping {batter_name}: fresh injury risk - {injury_reason}",
-            flush=True
-        )
+        print(f"Skipping {batter_name}: fresh injury risk - {injury_reason}", flush=True)
         sent_alerts.add(alert_key)
         return
 
     batter_stats = get_player_season_stats(batter_id, "hitting")
     pitcher_stats = get_player_season_stats(pitcher_id, "pitching")
     bvp = get_batter_vs_pitcher_history(batter_id, pitcher_id)
+    inning_pressure = get_inning_pressure(data, inning, half)
 
     scores = calculate_scores(
         batter_stats=batter_stats,
@@ -857,17 +1073,21 @@ def check_game(game_pk):
         strikes=strikes,
         outs=outs,
         bases_loaded=bases_loaded,
+        inning_pressure=inning_pressure,
     )
 
     bets = choose_bets(
         batter_name=batter_name,
+        offense_team=offense_team,
         scores=scores,
         bases_loaded=bases_loaded,
     )
 
     print(
         f"{batter_name} | "
-        f"HIT {scores['hit']} RBI {scores['rbi']} HR {scores['hr']} K {scores['k']} | "
+        f"HIT {scores['hit']} RBI {scores['rbi']} HR {scores['hr']} "
+        f"TB {scores['total_bases']} XBH {scores['xbh']} K {scores['k']} "
+        f"TEAM {scores['team_score_inning']} MELT {scores['meltdown']} | "
         f"BETS {bets}",
         flush=True
     )
@@ -875,14 +1095,12 @@ def check_game(game_pk):
     if not bets:
         return
 
-    best_bet = bets[0]
-
     msg = build_alert_message(
-        bet=best_bet,
+        bet=bets[0],
         all_bets=bets,
         offense_team=offense_team,
-        half=half,
-        inning=inning,
+        half=half_display,
+        inning=inning_display,
         outs=outs,
         balls=balls,
         strikes=strikes,
