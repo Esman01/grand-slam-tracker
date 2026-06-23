@@ -22,9 +22,15 @@ ALERT_MEMORY_SECONDS = int(os.getenv("ALERT_MEMORY_SECONDS", "14400"))
 LOOKAHEAD_BATTERS = int(os.getenv("LOOKAHEAD_BATTERS", "4"))
 MIN_TARGET_BATTERS_AWAY = int(os.getenv("MIN_TARGET_BATTERS_AWAY", "2"))
 
-MIN_GET_READY_SCORE = int(os.getenv("MIN_GET_READY_SCORE", "88"))
+MIN_GET_READY_SCORE = int(os.getenv("MIN_GET_READY_SCORE", "90"))
 MIN_MATCHUP_SCORE = int(os.getenv("MIN_MATCHUP_SCORE", "90"))
 MIN_PRESSURE_SCORE = int(os.getenv("MIN_PRESSURE_SCORE", "92"))
+MIN_PLAYER_MARKET_SCORE = int(os.getenv("MIN_PLAYER_MARKET_SCORE", "90"))
+MIN_MATCHUP_MARKET_SCORE = int(os.getenv("MIN_MATCHUP_MARKET_SCORE", "92"))
+MIN_ALERT_PRESSURE_SCORE = int(os.getenv("MIN_ALERT_PRESSURE_SCORE", "40"))
+STRONG_PITCHER_PRESSURE_SCORE = int(os.getenv("STRONG_PITCHER_PRESSURE_SCORE", "75"))
+MAX_MARKETS_PER_ALERT = int(os.getenv("MAX_MARKETS_PER_ALERT", "2"))
+SECONDARY_MARKET_MAX_DROP = int(os.getenv("SECONDARY_MARKET_MAX_DROP", "4"))
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 STATS_CACHE_SECONDS = int(os.getenv("STATS_CACHE_SECONDS", "900"))
@@ -1050,7 +1056,16 @@ def market_path(market, team_name=None):
     return "Check Live Player Props, Hits and Runs, or Innings"
 
 
-def top_player_markets(player_score):
+def has_runners_on(offense):
+    return any(base in offense for base in ["first", "second", "third"])
+
+
+def top_player_markets(
+    player_score,
+    min_score=MIN_PLAYER_MARKET_SCORE,
+    max_markets=MAX_MARKETS_PER_ALERT,
+    runners_on=True,
+):
     name = player_score["target"]["name"]
 
     markets = [
@@ -1062,7 +1077,48 @@ def top_player_markets(player_score):
     ]
 
     markets.sort(key=lambda x: x[1], reverse=True)
-    return markets[:3]
+
+    filtered = []
+    best_score = None
+
+    for market, score, label in markets:
+        if score < min_score:
+            continue
+        if market in ["Player RBI", "Player Home Run"] and not runners_on:
+            continue
+        if best_score is None:
+            best_score = score
+        elif best_score - score > SECONDARY_MARKET_MAX_DROP:
+            continue
+        filtered.append((market, score, label))
+        if len(filtered) >= max_markets:
+            break
+
+    return filtered
+
+
+def best_qualified_market_score(player_score, min_score=MIN_PLAYER_MARKET_SCORE, runners_on=True):
+    markets = top_player_markets(
+        player_score,
+        min_score=min_score,
+        max_markets=1,
+        runners_on=runners_on,
+    )
+    if not markets:
+        return 0
+    return markets[0][1]
+
+
+def is_low_quality_timing(outs, strikes):
+    return safe_int(outs) >= 2 and safe_int(strikes) >= 2
+
+
+def pitcher_context_allows_alert(pitcher, pressure_score, bases_loaded):
+    if pitcher["weakness"] > 0:
+        return True
+    if bases_loaded and pressure_score >= STRONG_PITCHER_PRESSURE_SCORE:
+        return True
+    return False
 
 
 def build_market_lines(markets, team_name=None):
@@ -1118,9 +1174,22 @@ def format_score_debug(player_score, pitcher, pressure_score):
     )
 
 
-def build_get_ready_alert(team, target_score, pressure_score, game_spot, base_text, inning_pressure, pitcher):
+def build_get_ready_alert(
+    team,
+    target_score,
+    pressure_score,
+    game_spot,
+    base_text,
+    inning_pressure,
+    pitcher,
+    runners_on=True,
+):
     target = target_score["target"]
-    markets = top_player_markets(target_score)
+    markets = top_player_markets(
+        target_score,
+        min_score=MIN_PLAYER_MARKET_SCORE,
+        runners_on=runners_on,
+    )
 
     return (
         "GET READY ALERT\n\n"
@@ -1145,9 +1214,21 @@ def build_get_ready_alert(team, target_score, pressure_score, game_spot, base_te
     )
 
 
-def build_matchup_alert(team, target_score, pitcher, game_spot, base_text, pressure_score):
+def build_matchup_alert(
+    team,
+    target_score,
+    pitcher,
+    game_spot,
+    base_text,
+    pressure_score,
+    runners_on=True,
+):
     target = target_score["target"]
-    markets = top_player_markets(target_score)
+    markets = top_player_markets(
+        target_score,
+        min_score=MIN_MATCHUP_MARKET_SCORE,
+        runners_on=runners_on,
+    )
 
     return (
         "MATCHUP ALERT\n\n"
@@ -1224,6 +1305,7 @@ def check_game(game_pk):
     outs = linescore.get("outs", "?")
 
     bases_loaded = "first" in offense and "second" in offense and "third" in offense
+    runners_on = has_runners_on(offense)
 
     if ONLY_BASES_LOADED and not bases_loaded:
         return
@@ -1254,13 +1336,22 @@ def check_game(game_pk):
             print(f"Skipping {target['name']}: injury risk - {injury_reason}", flush=True)
             continue
 
-        scored_targets.append(
-            score_player_target(
-                target=target,
-                pitcher=pitcher,
-                pressure_score=pressure_score,
-            )
+        player_score = score_player_target(
+            target=target,
+            pitcher=pitcher,
+            pressure_score=pressure_score,
         )
+        player_score["qualified_score"] = best_qualified_market_score(
+            player_score,
+            min_score=MIN_PLAYER_MARKET_SCORE,
+            runners_on=runners_on,
+        )
+        player_score["matchup_qualified_score"] = best_qualified_market_score(
+            player_score,
+            min_score=MIN_MATCHUP_MARKET_SCORE,
+            runners_on=runners_on,
+        )
+        scored_targets.append(player_score)
 
     if not scored_targets:
         return
@@ -1271,13 +1362,14 @@ def check_game(game_pk):
         target
         for target in scored_targets
         if safe_int(target["target"]["batters_away"]) >= MIN_TARGET_BATTERS_AWAY
+        and target["qualified_score"] > 0
     ]
 
     if not early_targets:
         print(f"{team}: no early targets available", flush=True)
         return
 
-    early_targets.sort(key=lambda x: x["best_score"], reverse=True)
+    early_targets.sort(key=lambda x: x["qualified_score"], reverse=True)
     best_target = early_targets[0]
 
     game_spot = f"{half_display} {inning_display} | {outs} outs | Count {balls}-{strikes}"
@@ -1287,17 +1379,51 @@ def check_game(game_pk):
     alert_type = None
     alert_score = 0
 
-    if best_target["best_score"] >= MIN_GET_READY_SCORE and pressure_score >= 65:
+    skip_reason = None
+
+    if pressure_score < MIN_ALERT_PRESSURE_SCORE:
+        skip_reason = f"pressure below {MIN_ALERT_PRESSURE_SCORE}"
+    elif is_low_quality_timing(outs, strikes):
+        skip_reason = "two strikes with two outs"
+    elif not pitcher_context_allows_alert(pitcher, pressure_score, bases_loaded):
+        skip_reason = "pitcher is not weak enough without bases-loaded pressure"
+
+    if skip_reason:
+        print(
+            f"{team} {game_spot} | Pitcher {pitcher_obj['name']} | "
+            f"Pressure {pressure_score} | Best qualified target "
+            f"{best_target['target']['name']} {best_target['target']['role']} "
+            f"{best_target['qualified_score']} | skipped: {skip_reason}",
+            flush=True,
+        )
+        return
+
+    if best_target["qualified_score"] >= MIN_GET_READY_SCORE and pressure_score >= 65:
         alert_type = "GET_READY"
-        alert_score = best_target["best_score"]
+        alert_score = best_target["qualified_score"]
         msg = build_get_ready_alert(
-            team, best_target, pressure_score, game_spot, base_text, inning_pressure, pitcher
+            team,
+            best_target,
+            pressure_score,
+            game_spot,
+            base_text,
+            inning_pressure,
+            pitcher,
+            runners_on=runners_on,
         )
 
-    elif best_target["best_score"] >= MIN_MATCHUP_SCORE:
+    elif best_target["matchup_qualified_score"] >= MIN_MATCHUP_SCORE:
         alert_type = "MATCHUP"
-        alert_score = best_target["best_score"]
-        msg = build_matchup_alert(team, best_target, pitcher, game_spot, base_text, pressure_score)
+        alert_score = best_target["matchup_qualified_score"]
+        msg = build_matchup_alert(
+            team,
+            best_target,
+            pitcher,
+            game_spot,
+            base_text,
+            pressure_score,
+            runners_on=runners_on,
+        )
 
     elif pressure_score >= MIN_PRESSURE_SCORE:
         alert_type = "PRESSURE"
@@ -1309,7 +1435,7 @@ def check_game(game_pk):
             f"{team} {game_spot} | Pitcher {pitcher_obj['name']} | "
             f"Pressure {pressure_score} | Best early target "
             f"{best_target['target']['name']} {best_target['target']['role']} "
-            f"{best_target['best_score']} | {format_score_debug(best_target, pitcher, pressure_score)} | no alert",
+            f"{best_target['qualified_score']} | {format_score_debug(best_target, pitcher, pressure_score)} | no alert",
             flush=True,
         )
         return
@@ -1342,7 +1468,15 @@ def check_game(game_pk):
         "base_state": base_text,
         "markets": [
             label
-            for _, _, label in top_player_markets(best_target)
+            for _, _, label in top_player_markets(
+                best_target,
+                min_score=(
+                    MIN_MATCHUP_MARKET_SCORE
+                    if alert_type == "MATCHUP"
+                    else MIN_PLAYER_MARKET_SCORE
+                ),
+                runners_on=runners_on,
+            )
         ],
         "status": "open",
     })

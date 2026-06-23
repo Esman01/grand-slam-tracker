@@ -59,6 +59,55 @@ class AlertThrottleTests(unittest.TestCase):
         self.assertFalse(main.should_send_alert("spot", 91))
 
 
+class AlertQualityFilterTests(unittest.TestCase):
+    def make_player_score(self):
+        return {
+            "target": {"name": "Test Hitter"},
+            "hrr": 93,
+            "hit": 91,
+            "total_bases": 86,
+            "rbi": 92,
+            "hr": 94,
+        }
+
+    def test_top_player_markets_limits_count_and_filters_empty_base_hr_rbi(self):
+        markets = main.top_player_markets(
+            self.make_player_score(),
+            min_score=90,
+            max_markets=2,
+            runners_on=False,
+        )
+
+        self.assertEqual([market[0] for market in markets], ["Player H+R+RBI", "Player Hits"])
+
+    def test_top_player_markets_omits_secondary_market_that_drops_too_far(self):
+        player_score = self.make_player_score()
+        player_score["hrr"] = 89
+        player_score["hit"] = 88
+        player_score["rbi"] = 90
+
+        markets = main.top_player_markets(
+            player_score,
+            min_score=90,
+            max_markets=3,
+            runners_on=True,
+        )
+
+        self.assertEqual([market[0] for market in markets], ["Player Home Run"])
+
+    def test_pitcher_context_requires_weakness_or_bases_loaded_pressure(self):
+        strong_pitcher = {"weakness": -12}
+
+        self.assertFalse(main.pitcher_context_allows_alert(strong_pitcher, 60, True))
+        self.assertTrue(main.pitcher_context_allows_alert(strong_pitcher, 80, True))
+        self.assertFalse(main.pitcher_context_allows_alert(strong_pitcher, 80, False))
+        self.assertTrue(main.pitcher_context_allows_alert({"weakness": 4}, 40, False))
+
+    def test_low_quality_timing_blocks_two_strike_two_out_spots(self):
+        self.assertTrue(main.is_low_quality_timing(2, 2))
+        self.assertFalse(main.is_low_quality_timing(1, 2))
+
+
 class ResultTrackingTests(unittest.TestCase):
     def test_make_alert_id_is_stable_for_alert_context(self):
         now = main.datetime(2026, 6, 23, 12, 0, 0)
