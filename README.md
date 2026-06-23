@@ -11,6 +11,7 @@ Grand Slam Tracker is a Telegram worker that watches live MLB games and sends pr
 5. Scores upcoming hitters and inning pressure.
 6. Sends `GET_READY`, `MATCHUP`, or `PRESSURE` alerts to active subscribers.
 7. Records each sent alert with a tracking ID so users can report the result.
+8. Posts alert and result telemetry to the sheet webhook for the `alerts` tab.
 
 ## Environment variables
 
@@ -54,6 +55,10 @@ Optional:
 
 Each alert includes its own tracking ID and example report commands.
 
+## Sheet telemetry
+
+The same `SHEET_WEBHOOK_URL` handles subscribers and alert telemetry. Alert creation posts include `kind: "alert"` and result updates include `kind: "alert_result"`. The companion Apps Script should route those payloads to an `alerts` tab.
+
 ## Local setup
 
 ```powershell
@@ -87,4 +92,4 @@ Configure the required environment variables on the hosting platform before star
 python -m unittest
 ```
 
-The tests cover score helpers, cache expiry, alert throttling, batting-order targeting, current pitcher detection, and result tracking.
+The tests cover score helpers, cache expiry, alert throttling, batting-order targeting, current pitcher detection, result tracking, and sheet telemetry calls.
