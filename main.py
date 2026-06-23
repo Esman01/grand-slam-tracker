@@ -202,6 +202,20 @@ def save_result_store(store):
         print("Results store write error:", exc, flush=True)
 
 
+def post_sheet_event(payload):
+    try:
+        data = request_json("post", SHEET_WEBHOOK_URL, json=payload)
+    except Exception as exc:
+        print("Sheet telemetry error:", exc, flush=True)
+        return False
+
+    if data.get("ok") is not True:
+        print("Sheet telemetry rejected:", data, flush=True)
+        return False
+
+    return True
+
+
 def make_alert_id(game_pk, inning, half, alert_type, target_id, now=None):
     now = now or utc_now()
     half_code = str(half or "?")[:1].upper()
@@ -225,6 +239,10 @@ def record_alert(alert):
         alerts.append(alert)
 
     save_result_store(store)
+    payload = dict(alert)
+    payload["kind"] = "alert"
+    payload["alert_id"] = payload.get("id")
+    post_sheet_event(payload)
 
 
 def record_alert_outcome(alert_id, outcome, reported_by):
@@ -235,6 +253,14 @@ def record_alert_outcome(alert_id, outcome, reported_by):
             alert["outcome_at"] = utc_now().isoformat()
             alert["reported_by"] = str(reported_by)
             save_result_store(store)
+            post_sheet_event({
+                "kind": "alert_result",
+                "alert_id": alert["id"],
+                "status": outcome,
+                "outcome": outcome,
+                "outcome_at": alert["outcome_at"],
+                "reported_by": alert["reported_by"],
+            })
             return alert
     return None
 
