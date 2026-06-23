@@ -12,17 +12,20 @@ ONLY_BASES_LOADED = os.getenv("ONLY_BASES_LOADED", "true").lower() == "true"
 ACTIONABLE_ONLY = os.getenv("ACTIONABLE_ONLY", "true").lower() == "true"
 ALLOW_FAST_LOCK_MARKETS = os.getenv("ALLOW_FAST_LOCK_MARKETS", "false").lower() == "true"
 
-MIN_HIT_SCORE = int(os.getenv("MIN_HIT_SCORE", "82"))
-MIN_RBI_SCORE = int(os.getenv("MIN_RBI_SCORE", "86"))
-MIN_HR_SCORE = int(os.getenv("MIN_HR_SCORE", "88"))
-MIN_K_SCORE = int(os.getenv("MIN_K_SCORE", "88"))
-MIN_TOTAL_BASES_SCORE = int(os.getenv("MIN_TOTAL_BASES_SCORE", "85"))
-MIN_XBH_SCORE = int(os.getenv("MIN_XBH_SCORE", "88"))
-MIN_TEAM_SCORE_INNING = int(os.getenv("MIN_TEAM_SCORE_INNING", "88"))
-MIN_MELTDOWN_SCORE = int(os.getenv("MIN_MELTDOWN_SCORE", "85"))
-MIN_INNING_HR_SCORE = int(os.getenv("MIN_INNING_HR_SCORE", "90"))
-MIN_LIVE_TEAM_TOTAL_SCORE = int(os.getenv("MIN_LIVE_TEAM_TOTAL_SCORE", "84"))
-MIN_GAME_TOTAL_SCORE = int(os.getenv("MIN_GAME_TOTAL_SCORE", "87"))
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "180"))
+MAX_ALERTS_PER_HALF_INNING = int(os.getenv("MAX_ALERTS_PER_HALF_INNING", "1"))
+
+MIN_HIT_SCORE = int(os.getenv("MIN_HIT_SCORE", "90"))
+MIN_RBI_SCORE = int(os.getenv("MIN_RBI_SCORE", "92"))
+MIN_HR_SCORE = int(os.getenv("MIN_HR_SCORE", "94"))
+MIN_K_SCORE = int(os.getenv("MIN_K_SCORE", "94"))
+MIN_TOTAL_BASES_SCORE = int(os.getenv("MIN_TOTAL_BASES_SCORE", "92"))
+MIN_XBH_SCORE = int(os.getenv("MIN_XBH_SCORE", "94"))
+MIN_TEAM_SCORE_INNING = int(os.getenv("MIN_TEAM_SCORE_INNING", "94"))
+MIN_MELTDOWN_SCORE = int(os.getenv("MIN_MELTDOWN_SCORE", "90"))
+MIN_INNING_HR_SCORE = int(os.getenv("MIN_INNING_HR_SCORE", "94"))
+MIN_LIVE_TEAM_TOTAL_SCORE = int(os.getenv("MIN_LIVE_TEAM_TOTAL_SCORE", "92"))
+MIN_GAME_TOTAL_SCORE = int(os.getenv("MIN_GAME_TOTAL_SCORE", "92"))
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 
@@ -32,7 +35,7 @@ RECENT_INJURY_NAMES = [
     if x.strip()
 ]
 
-sent_alerts = set()
+sent_alerts = {}
 player_stats_cache = {}
 injury_cache = {}
 last_update_id = None
@@ -68,11 +71,9 @@ def grade(score):
     shown = display_score(score)
     if shown >= 94:
         return "🔥 ELITE"
-    if shown >= 88:
+    if shown >= 90:
         return "✅ STRONG"
-    if shown >= 82:
-        return "🟡 PLAYABLE"
-    return "PASS"
+    return "PLAYABLE"
 
 
 def lock_label(risk):
@@ -128,13 +129,16 @@ def broadcast(msg):
 def subscription_message():
     return (
         "✅ Subscription Active\n\n"
-        "You’ll receive actionable MLB live bet alerts.\n\n"
-        "The bot prioritizes markets that are more likely to be open:\n"
+        "You’ll receive high-confidence MLB live bet alerts.\n\n"
+        "The bot prioritizes:\n"
         "• Team Total Over\n"
         "• Game Total Over\n"
-        "• Team To Score This Inning\n"
-        "• Inning Total Runs\n\n"
-        "Fast-lock player props are hidden unless enabled.\n\n"
+        "• Current Inning Total Runs Over\n"
+        "• Team To Score This Inning\n\n"
+        "Spam control is on:\n"
+        "• Max 1 alert per team per half-inning\n"
+        "• Cooldown between repeat spots\n"
+        "• Fast-lock player props hidden by default\n\n"
         "Commands:\n"
         "/status - check status\n"
         "/stop - stop alerts\n"
@@ -579,7 +583,9 @@ def calculate_count_edge(balls, strikes):
 
     edge = {"hit": 0, "rbi": 0, "hr": 0, "k": 0, "tb": 0, "xbh": 0}
 
-    if balls == 3 and strikes == 0:
+    if balls >= 4:
+        edge.update({"hit": 4, "rbi": 12, "hr": 1, "k": -20, "tb": 2, "xbh": 1})
+    elif balls == 3 and strikes == 0:
         edge.update({"hit": 5, "rbi": 14, "hr": 3, "k": -18, "tb": 4, "xbh": 2})
     elif balls == 3 and strikes == 1:
         edge.update({"hit": 6, "rbi": 12, "hr": 5, "k": -10, "tb": 5, "xbh": 4})
@@ -771,90 +777,31 @@ def calculate_scores(
 
     meltdown = calculate_meltdown_score(pitcher, inning_pressure, bases_loaded, outs)
 
-    hit_score = (
-        batter["hit_score"]
-        - pitcher["contact_suppression"]
-        + bvp["score"]
-        + count["hit"]
-        + outs_edge["hit"]
-    )
-
-    rbi_score = (
-        batter["rbi_score"]
-        - pitcher["rbi_suppression"]
-        + bvp["score"]
-        + count["rbi"]
-        + outs_edge["rbi"]
-        + (10 if bases_loaded else 0)
-        + ((meltdown - 70) * 0.25 if meltdown > 70 else 0)
-    )
-
-    hr_score = (
-        batter["hr_score"]
-        - pitcher["hr_suppression"]
-        + bvp["score"]
-        + count["hr"]
-        + outs_edge["hr"]
-    )
-
-    k_score = (
-        batter["batter_k_risk"]
-        + pitcher["strikeout_boost"]
-        - bvp["score"]
-        + count["k"]
-        + outs_edge["k"]
-    )
-
-    total_bases_score = (
-        batter["total_bases_score"]
-        - pitcher["tb_suppression"]
-        + bvp["score"]
-        + count["tb"]
-    )
-
-    xbh_score = (
-        batter["xbh_score"]
-        - pitcher["xbh_suppression"]
-        + bvp["score"]
-        + count["xbh"]
-    )
+    hit_score = batter["hit_score"] - pitcher["contact_suppression"] + bvp["score"] + count["hit"] + outs_edge["hit"]
+    rbi_score = batter["rbi_score"] - pitcher["rbi_suppression"] + bvp["score"] + count["rbi"] + outs_edge["rbi"] + (10 if bases_loaded else 0)
+    hr_score = batter["hr_score"] - pitcher["hr_suppression"] + bvp["score"] + count["hr"] + outs_edge["hr"]
+    k_score = batter["batter_k_risk"] + pitcher["strikeout_boost"] - bvp["score"] + count["k"] + outs_edge["k"]
+    total_bases_score = batter["total_bases_score"] - pitcher["tb_suppression"] + bvp["score"] + count["tb"]
+    xbh_score = batter["xbh_score"] - pitcher["xbh_suppression"] + bvp["score"] + count["xbh"]
 
     team_score_inning = (
-        45
-        + meltdown * 0.45
-        + outs_edge["team"]
-        + (18 if bases_loaded else 0)
-        + inning_pressure["hits"] * 5
-        + inning_pressure["walks"] * 7
-        + context
+        45 + meltdown * 0.45 + outs_edge["team"] + (18 if bases_loaded else 0)
+        + inning_pressure["hits"] * 5 + inning_pressure["walks"] * 7 + context
     )
 
     live_team_total_over = (
-        48
-        + meltdown * 0.42
-        + inning_pressure["hits"] * 4
-        + inning_pressure["walks"] * 5
-        + (10 if bases_loaded else 0)
-        + context
+        48 + meltdown * 0.42 + inning_pressure["hits"] * 4 + inning_pressure["walks"] * 5
+        + (10 if bases_loaded else 0) + context
     )
 
     game_total_over = (
-        50
-        + meltdown * 0.30
-        + inning_pressure["runs"] * 5
-        + inning_pressure["hits"] * 3
-        + inning_pressure["walks"] * 4
-        + (7 if bases_loaded else 0)
-        + context
+        50 + meltdown * 0.30 + inning_pressure["runs"] * 5 + inning_pressure["hits"] * 3
+        + inning_pressure["walks"] * 4 + (7 if bases_loaded else 0) + context
     )
 
     inning_total_runs = (
-        42
-        + meltdown * 0.48
-        + inning_pressure["hits"] * 6
-        + inning_pressure["walks"] * 8
-        + (20 if bases_loaded else 0)
-        + outs_edge["team"]
+        42 + meltdown * 0.48 + inning_pressure["hits"] * 6 + inning_pressure["walks"] * 8
+        + (20 if bases_loaded else 0) + outs_edge["team"]
     )
 
     inning_hr_score = (
@@ -890,9 +837,7 @@ def market_path(bet_type, team_name):
             "Hits and Runs → Team Total Runs\n"
             f"or Hits and Runs → {team_name} Alt. Total Runs"
         ),
-        "GAME TOTAL OVER": (
-            "Live SGP → Game Lines → Total → Over"
-        ),
+        "GAME TOTAL OVER": "Live SGP → Game Lines → Total → Over",
         "TEAM SCORE THIS INNING": (
             "Innings → Inning Total Runs\n"
             "or Live Specials → Team To Score This Inning"
@@ -979,105 +924,45 @@ def is_actionable_market(bet_type):
 def choose_bets(batter_name, offense_team, scores, bases_loaded):
     bets = []
 
-    if scores["live_team_total_over"] >= MIN_LIVE_TEAM_TOTAL_SCORE:
-        bets.append({
-            "type": "LIVE TEAM TOTAL OVER",
-            "score": scores["live_team_total_over"],
-            "bet": f"{offense_team} Team Total Over",
-            "action_note": "Best match for this pressure spot. More directly tied to this team scoring."
-        })
+    candidates = [
+        ("LIVE TEAM TOTAL OVER", scores["live_team_total_over"], f"{offense_team} Team Total Over", "Best match for this pressure spot. More directly tied to this team scoring."),
+        ("GAME TOTAL OVER", scores["game_total_over"], "Game Total Over", "Usually the easiest live market to find."),
+        ("PITCHER MELTDOWN", scores["meltdown"], f"{offense_team} Team Total Over", "Pitcher is losing control. Use team total first, game total if needed."),
+        ("INNING TOTAL RUNS", scores["inning_total_runs"], "Current Inning Total Runs Over", "Good if the inning market is open."),
+        ("TEAM SCORE THIS INNING", scores["team_score_inning"], f"{offense_team} To Score This Inning", "Strong spot, but this market can lock quickly."),
+        ("RBI", scores["rbi"], f"{batter_name} RBI", "Fast-lock player prop. Only playable if still visible."),
+        ("HIT", scores["hit"], f"{batter_name} Hit", "Fast-lock player prop."),
+        ("TOTAL BASES", scores["total_bases"], f"{batter_name} Total Bases Over", "Fast-lock player prop."),
+        ("EXTRA BASE HIT", scores["xbh"], f"{batter_name} Extra Base Hit", "Fast-lock player prop."),
+        ("HOME RUN", scores["hr"], f"{batter_name} Home Run", "Lottery market."),
+        ("1+ HR THIS INNING", scores["inning_hr"], "1+ Home Run This Inning", "Often locks during the current plate appearance."),
+        ("STRIKEOUT", scores["k"], f"{batter_name} Strikeout", "Fastest-lock market."),
+    ]
 
-    if scores["game_total_over"] >= MIN_GAME_TOTAL_SCORE:
-        bets.append({
-            "type": "GAME TOTAL OVER",
-            "score": scores["game_total_over"],
-            "bet": "Game Total Over",
-            "action_note": "Usually the easiest live market to find."
-        })
+    thresholds = {
+        "LIVE TEAM TOTAL OVER": MIN_LIVE_TEAM_TOTAL_SCORE,
+        "GAME TOTAL OVER": MIN_GAME_TOTAL_SCORE,
+        "PITCHER MELTDOWN": MIN_MELTDOWN_SCORE,
+        "INNING TOTAL RUNS": MIN_TEAM_SCORE_INNING,
+        "TEAM SCORE THIS INNING": MIN_TEAM_SCORE_INNING,
+        "RBI": MIN_RBI_SCORE if bases_loaded else 999,
+        "HIT": MIN_HIT_SCORE,
+        "TOTAL BASES": MIN_TOTAL_BASES_SCORE,
+        "EXTRA BASE HIT": MIN_XBH_SCORE,
+        "HOME RUN": MIN_HR_SCORE,
+        "1+ HR THIS INNING": MIN_INNING_HR_SCORE,
+        "STRIKEOUT": MIN_K_SCORE,
+    }
 
-    if scores["meltdown"] >= MIN_MELTDOWN_SCORE:
-        bets.append({
-            "type": "PITCHER MELTDOWN",
-            "score": scores["meltdown"],
-            "bet": f"{offense_team} Team Total Over",
-            "action_note": "Pitcher is losing control. Use team total first, game total if team total is not listed."
-        })
+    for bet_type, score, bet_text, note in candidates:
+        if score >= thresholds.get(bet_type, 999) and is_actionable_market(bet_type):
+            bets.append({
+                "type": bet_type,
+                "score": score,
+                "bet": bet_text,
+                "action_note": note,
+            })
 
-    if scores["inning_total_runs"] >= MIN_TEAM_SCORE_INNING:
-        bets.append({
-            "type": "INNING TOTAL RUNS",
-            "score": scores["inning_total_runs"],
-            "bet": "Current Inning Total Runs Over",
-            "action_note": "Good if the inning market is open. Often appears under the Innings tab."
-        })
-
-    if scores["team_score_inning"] >= MIN_TEAM_SCORE_INNING:
-        bets.append({
-            "type": "TEAM SCORE THIS INNING",
-            "score": scores["team_score_inning"],
-            "bet": f"{offense_team} To Score This Inning",
-            "action_note": "Strong spot, but this market can lock quickly. Use inning total or team total if locked."
-        })
-
-    if bases_loaded and scores["rbi"] >= MIN_RBI_SCORE:
-        bets.append({
-            "type": "RBI",
-            "score": scores["rbi"],
-            "bet": f"{batter_name} RBI",
-            "action_note": "Fast-lock player prop. Only playable if still visible."
-        })
-
-    if scores["hit"] >= MIN_HIT_SCORE:
-        bets.append({
-            "type": "HIT",
-            "score": scores["hit"],
-            "bet": f"{batter_name} Hit",
-            "action_note": "Fast-lock player prop. Often unavailable once batter is already up."
-        })
-
-    if scores["total_bases"] >= MIN_TOTAL_BASES_SCORE:
-        bets.append({
-            "type": "TOTAL BASES",
-            "score": scores["total_bases"],
-            "bet": f"{batter_name} Total Bases Over",
-            "action_note": "Fast-lock player prop. More playable before the plate appearance."
-        })
-
-    if scores["xbh"] >= MIN_XBH_SCORE:
-        bets.append({
-            "type": "EXTRA BASE HIT",
-            "score": scores["xbh"],
-            "bet": f"{batter_name} Extra Base Hit",
-            "action_note": "Fast-lock player prop. Often unavailable mid-PA."
-        })
-
-    if scores["hr"] >= MIN_HR_SCORE:
-        bets.append({
-            "type": "HOME RUN",
-            "score": scores["hr"],
-            "bet": f"{batter_name} Home Run",
-            "action_note": "Lottery market. If locked, use inning HR or game total."
-        })
-
-    if scores["inning_hr"] >= MIN_INNING_HR_SCORE:
-        bets.append({
-            "type": "1+ HR THIS INNING",
-            "score": scores["inning_hr"],
-            "bet": "1+ Home Run This Inning",
-            "action_note": "Often locks during the current plate appearance."
-        })
-
-    if scores["k"] >= MIN_K_SCORE:
-        bets.append({
-            "type": "STRIKEOUT",
-            "score": scores["k"],
-            "bet": f"{batter_name} Strikeout",
-            "action_note": "Fastest-lock market. Usually not actionable unless posted before pitch."
-        })
-
-    bets = [b for b in bets if is_actionable_market(b["type"])]
-
-    # Sort by directness first, then lock risk, then score.
     priority = {
         "LIVE TEAM TOTAL OVER": 1,
         "PITCHER MELTDOWN": 2,
@@ -1095,6 +980,34 @@ def choose_bets(batter_name, offense_team, scores, bases_loaded):
 
     bets.sort(key=lambda x: (priority.get(x["type"], 99), lock_risk(x["type"]), -x["score"]))
     return bets[:2]
+
+
+def should_send_alert(spot_key, best_score):
+    now = time.time()
+
+    info = sent_alerts.get(spot_key)
+
+    if not info:
+        sent_alerts[spot_key] = {
+            "count": 1,
+            "last_time": now,
+            "best_score": best_score,
+        }
+        return True
+
+    if info["count"] >= MAX_ALERTS_PER_HALF_INNING:
+        return False
+
+    if now - info["last_time"] < ALERT_COOLDOWN_SECONDS:
+        return False
+
+    if best_score < info["best_score"] + 5:
+        return False
+
+    info["count"] += 1
+    info["last_time"] = now
+    info["best_score"] = best_score
+    return True
 
 
 def get_current_pitcher(data):
@@ -1239,16 +1152,10 @@ def check_game(game_pk):
     balls = count["balls"]
     strikes = count["strikes"]
 
-    alert_key = f"{game_pk}-{inning}-{half}-{batter_id}-{outs}-{balls}-{strikes}-{away_runs}-{home_runs}"
-
-    if alert_key in sent_alerts:
-        return
-
     injured, injury_reason = recently_reinstated_from_injury(batter_id, batter_name)
 
     if injured:
         print(f"Skipping {batter_name}: fresh injury risk - {injury_reason}", flush=True)
-        sent_alerts.add(alert_key)
         return
 
     batter_stats = get_player_season_stats(batter_id, "hitting")
@@ -1287,7 +1194,13 @@ def check_game(game_pk):
     )
 
     if not bets:
-        sent_alerts.add(alert_key)
+        return
+
+    best_score = bets[0]["score"]
+    spot_key = f"{game_pk}-{inning}-{half}-{offense_team}"
+
+    if not should_send_alert(spot_key, best_score):
+        print(f"Skipping duplicate/cooldown alert for {spot_key}", flush=True)
         return
 
     msg = build_alert_message(
@@ -1308,7 +1221,6 @@ def check_game(game_pk):
     )
 
     broadcast(msg)
-    sent_alerts.add(alert_key)
 
 
 def main():
