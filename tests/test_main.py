@@ -71,15 +71,16 @@ class ResultTrackingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             result_file = os.path.join(temp_dir, "results.json")
             with patch.object(main, "RESULTS_FILE", result_file):
-                main.record_alert({
-                    "id": "alert-1",
-                    "sent_at": main.utc_now().isoformat(),
-                    "alert_type": "GET_READY",
-                    "target": "Test Player",
-                    "status": "open",
-                })
+                with patch.object(main, "post_sheet_event", return_value=True):
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "GET_READY",
+                        "target": "Test Player",
+                        "status": "open",
+                    })
 
-                alert = main.record_alert_outcome("alert-1", "win", "123")
+                    alert = main.record_alert_outcome("alert-1", "win", "123")
 
                 self.assertEqual(alert["status"], "win")
                 self.assertEqual(alert["reported_by"], "123")
@@ -88,19 +89,58 @@ class ResultTrackingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             result_file = os.path.join(temp_dir, "results.json")
             with patch.object(main, "RESULTS_FILE", result_file):
-                main.record_alert({
-                    "id": "alert-1",
-                    "sent_at": main.utc_now().isoformat(),
-                    "alert_type": "MATCHUP",
-                    "target": "Test Player",
-                    "status": "open",
-                })
-                main.record_alert_outcome("alert-1", "loss", "123")
+                with patch.object(main, "post_sheet_event", return_value=True):
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "MATCHUP",
+                        "target": "Test Player",
+                        "status": "open",
+                    })
+                    main.record_alert_outcome("alert-1", "loss", "123")
 
                 recap = main.build_results_recap(days=1)
 
                 self.assertIn("Record: 0-1-0", recap)
                 self.assertIn("MATCHUP: 1", recap)
+
+    def test_record_alert_posts_sheet_telemetry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                with patch.object(main, "post_sheet_event", return_value=True) as post:
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "GET_READY",
+                        "target": "Test Player",
+                        "status": "open",
+                    })
+
+                    payload = post.call_args.args[0]
+                    self.assertEqual(payload["kind"], "alert")
+                    self.assertEqual(payload["alert_id"], "alert-1")
+
+    def test_record_alert_outcome_posts_sheet_telemetry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                with patch.object(main, "post_sheet_event", return_value=True) as post:
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "GET_READY",
+                        "target": "Test Player",
+                        "status": "open",
+                    })
+                    post.reset_mock()
+
+                    main.record_alert_outcome("alert-1", "win", "123")
+
+                    payload = post.call_args.args[0]
+                    self.assertEqual(payload["kind"], "alert_result")
+                    self.assertEqual(payload["alert_id"], "alert-1")
+                    self.assertEqual(payload["status"], "win")
 
 
 class LiveFeedParsingTests(unittest.TestCase):
