@@ -1,16 +1,22 @@
 import os
 import time
-import requests
 from datetime import datetime, timedelta
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-SHEET_WEBHOOK_URL = os.environ["SHEET_WEBHOOK_URL"]
+import requests
+
+
+MLB_API_BASE = "https://statsapi.mlb.com/api"
+TELEGRAM_API_BASE = "https://api.telegram.org"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SHEET_WEBHOOK_URL = os.getenv("SHEET_WEBHOOK_URL")
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
 ONLY_BASES_LOADED = os.getenv("ONLY_BASES_LOADED", "false").lower() == "true"
 
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
 MAX_ALERTS_PER_HALF_INNING = int(os.getenv("MAX_ALERTS_PER_HALF_INNING", "1"))
+ALERT_MEMORY_SECONDS = int(os.getenv("ALERT_MEMORY_SECONDS", "14400"))
 
 LOOKAHEAD_BATTERS = int(os.getenv("LOOKAHEAD_BATTERS", "4"))
 MIN_TARGET_BATTERS_AWAY = int(os.getenv("MIN_TARGET_BATTERS_AWAY", "2"))
@@ -20,6 +26,9 @@ MIN_MATCHUP_SCORE = int(os.getenv("MIN_MATCHUP_SCORE", "90"))
 MIN_PRESSURE_SCORE = int(os.getenv("MIN_PRESSURE_SCORE", "92"))
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
+STATS_CACHE_SECONDS = int(os.getenv("STATS_CACHE_SECONDS", "900"))
+INJURY_CACHE_SECONDS = int(os.getenv("INJURY_CACHE_SECONDS", "3600"))
+TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", ".telegram_offset")
 
 RECENT_INJURY_NAMES = [
     x.strip().lower()
@@ -33,12 +42,24 @@ injury_cache = {}
 last_update_id = None
 
 
+def validate_config():
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not SHEET_WEBHOOK_URL:
+        missing.append("SHEET_WEBHOOK_URL")
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s): " + ", ".join(missing)
+        )
+
+
 def safe_float(value, default=0.0):
     try:
         if value in [None, "", ".---", "---"]:
             return default
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -47,7 +68,7 @@ def safe_int(value, default=0):
         if value in [None, "", ".---", "---"]:
             return default
         return int(float(value))
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -62,26 +83,82 @@ def display_score(score):
 def grade(score):
     shown = display_score(score)
     if shown >= 94:
-        return "🔥 ELITE"
+        return "ELITE"
     if shown >= 90:
-        return "✅ STRONG"
+        return "STRONG"
     if shown >= 86:
-        return "🟡 GOOD"
+        return "GOOD"
     return "WATCH"
 
 
+def request_json(method, url, **kwargs):
+    response = requests.request(method, url, timeout=kwargs.pop("timeout", 10), **kwargs)
+    response.raise_for_status()
+    return response.json()
+
+
+def cache_get(cache, key):
+    entry = cache.get(key)
+    if not entry:
+        return None
+    expires_at, value = entry
+    if time.time() >= expires_at:
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def cache_set(cache, key, value, ttl_seconds):
+    cache[key] = (time.time() + ttl_seconds, value)
+    return value
+
+
+def prune_sent_alerts(now=None):
+    now = now or time.time()
+    expired = [
+        key
+        for key, info in sent_alerts.items()
+        if now - info.get("last_time", 0) > ALERT_MEMORY_SECONDS
+    ]
+    for key in expired:
+        sent_alerts.pop(key, None)
+
+
+def load_last_update_id():
+    try:
+        with open(TELEGRAM_OFFSET_FILE, "r", encoding="utf-8") as handle:
+            return safe_int(handle.read().strip(), None)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        print("Telegram offset read error:", exc, flush=True)
+        return None
+
+
+def save_last_update_id(update_id):
+    if update_id is None:
+        return
+    try:
+        with open(TELEGRAM_OFFSET_FILE, "w", encoding="utf-8") as handle:
+            handle.write(str(update_id))
+    except OSError as exc:
+        print("Telegram offset write error:", exc, flush=True)
+
+
 def send_telegram(chat_id, msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": chat_id, "text": msg}, timeout=10)
+    url = f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendMessage"
+    data = request_json("post", url, data={"chat_id": chat_id, "text": msg})
+    if data.get("ok") is not True:
+        raise RuntimeError(f"Telegram send failed: {data}")
+    return data
 
 
 def get_sheet_subscribers():
     try:
-        response = requests.get(SHEET_WEBHOOK_URL, timeout=10)
-        data = response.json()
+        data = request_json("get", SHEET_WEBHOOK_URL)
         return set(str(x) for x in data.get("subscribers", []))
-    except Exception as e:
-        print("Sheet subscriber error:", e, flush=True)
+    except Exception as exc:
+        print("Sheet subscriber error:", exc, flush=True)
         return set()
 
 
@@ -94,27 +171,29 @@ def save_subscriber(chat_id, username="", first_name="", status="active"):
     }
 
     try:
-        response = requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=10)
-        data = response.json()
+        data = request_json("post", SHEET_WEBHOOK_URL, json=payload)
         return data.get("ok") is True
-    except Exception as e:
-        print("Sheet save error:", e, flush=True)
+    except Exception as exc:
+        print("Sheet save error:", exc, flush=True)
         return False
 
 
 def broadcast(msg):
-    for chat_id in get_sheet_subscribers():
+    subscribers = get_sheet_subscribers()
+    print(f"Broadcasting to {len(subscribers)} subscriber(s)", flush=True)
+    for chat_id in subscribers:
         try:
             send_telegram(chat_id, msg)
-        except Exception as e:
-            print(f"Send error to {chat_id}:", e, flush=True)
+        except Exception as exc:
+            print(f"Send error to {chat_id}:", exc, flush=True)
 
 
 def subscription_message():
     return (
-        "✅ Subscription Active\n\n"
-        "You’ll receive predictive MLB live betting alerts.\n\n"
-        "The bot now looks 2–4 batters ahead using the live batting order so you have more time before markets lock.\n\n"
+        "Subscription Active\n\n"
+        "You'll receive predictive MLB live betting alerts.\n\n"
+        "The bot looks 2-4 batters ahead using the live batting order so you "
+        "have more time before markets lock.\n\n"
         "Commands:\n"
         "/status - check status\n"
         "/stop - stop alerts\n"
@@ -125,20 +204,21 @@ def subscription_message():
 def check_telegram_messages():
     global last_update_id
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    url = f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/getUpdates"
     params = {}
 
     if last_update_id is not None:
         params["offset"] = last_update_id + 1
 
     try:
-        data = requests.get(url, params=params, timeout=10).json()
-    except Exception as e:
-        print("Telegram update error:", e, flush=True)
+        data = request_json("get", url, params=params)
+    except Exception as exc:
+        print("Telegram update error:", exc, flush=True)
         return
 
     for update in data.get("result", []):
         last_update_id = update.get("update_id", last_update_id)
+        save_last_update_id(last_update_id)
 
         message = update.get("message", {})
         chat = message.get("chat", {})
@@ -155,38 +235,43 @@ def check_telegram_messages():
             if save_subscriber(chat_id, username, first_name, "active"):
                 send_telegram(chat_id, subscription_message())
             else:
-                send_telegram(chat_id, "⚠️ Subscription failed. Send /join again.")
+                send_telegram(chat_id, "Subscription failed. Send /join again.")
 
         elif text.startswith("/stop"):
             if save_subscriber(chat_id, username, first_name, "inactive"):
-                send_telegram(chat_id, "❌ Alerts stopped.\n\nSend /join to restart.")
+                send_telegram(chat_id, "Alerts stopped.\n\nSend /join to restart.")
             else:
-                send_telegram(chat_id, "⚠️ Stop failed. Send /stop again.")
+                send_telegram(chat_id, "Stop failed. Send /stop again.")
 
         elif text.startswith("/status"):
             subscribers = get_sheet_subscribers()
             if str(chat_id) in subscribers:
-                send_telegram(chat_id, "✅ Bot is online.\n\nSubscription Status: ACTIVE")
+                send_telegram(chat_id, "Bot is online.\n\nSubscription Status: ACTIVE")
             else:
-                send_telegram(chat_id, "⚠️ Bot is online, but you are NOT active.\n\nSend /join.")
+                send_telegram(
+                    chat_id,
+                    "Bot is online, but you are NOT active.\n\nSend /join.",
+                )
 
         else:
             send_telegram(
                 chat_id,
-                "⚾ MLB Betting Alert Bot\n\n"
+                "MLB Betting Alert Bot\n\n"
                 "Send /join to activate alerts.\n"
                 "Send /status to check status.\n"
-                "Send /stop to stop alerts."
+                "Send /stop to stop alerts.",
             )
 
 
-def get_today_games():
-    url = "https://statsapi.mlb.com/api/v1/schedule?sportId=1"
+def get_today_games(today=None):
+    today = today or datetime.now()
+    date_text = today.strftime("%Y-%m-%d")
+    url = f"{MLB_API_BASE}/v1/schedule?sportId=1&date={date_text}"
 
     try:
-        data = requests.get(url, timeout=10).json()
-    except Exception as e:
-        print("Schedule error:", e, flush=True)
+        data = request_json("get", url)
+    except Exception as exc:
+        print("Schedule error:", exc, flush=True)
         return []
 
     games = []
@@ -205,38 +290,34 @@ def get_player_season_stats(player_id, group):
         return {}
 
     cache_key = f"{group}-{player_id}"
-
-    if cache_key in player_stats_cache:
-        return player_stats_cache[cache_key]
+    cached = cache_get(player_stats_cache, cache_key)
+    if cached is not None:
+        return cached
 
     url = (
-        f"https://statsapi.mlb.com/api/v1/people/{player_id}"
+        f"{MLB_API_BASE}/v1/people/{player_id}"
         f"?hydrate=stats(group=[{group}],type=[season])"
     )
 
     try:
-        data = requests.get(url, timeout=10).json()
+        data = request_json("get", url)
         person = data.get("people", [{}])[0]
         stats_blocks = person.get("stats", [])
 
         if not stats_blocks:
-            player_stats_cache[cache_key] = {}
-            return {}
+            return cache_set(player_stats_cache, cache_key, {}, STATS_CACHE_SECONDS)
 
         splits = stats_blocks[0].get("splits", [])
 
         if not splits:
-            player_stats_cache[cache_key] = {}
-            return {}
+            return cache_set(player_stats_cache, cache_key, {}, STATS_CACHE_SECONDS)
 
         stats = splits[0].get("stat", {})
-        player_stats_cache[cache_key] = stats
-        return stats
+        return cache_set(player_stats_cache, cache_key, stats, STATS_CACHE_SECONDS)
 
-    except Exception as e:
-        print(f"Stats error {group} {player_id}:", e, flush=True)
-        player_stats_cache[cache_key] = {}
-        return {}
+    except Exception as exc:
+        print(f"Stats error {group} {player_id}:", exc, flush=True)
+        return cache_set(player_stats_cache, cache_key, {}, 60)
 
 
 def recently_reinstated_from_injury(player_id, player_name):
@@ -247,22 +328,22 @@ def recently_reinstated_from_injury(player_id, player_name):
         return True, "Manual recent injury list"
 
     cache_key = f"injury-{player_id}"
-
-    if cache_key in injury_cache:
-        return injury_cache[cache_key]
+    cached = cache_get(injury_cache, cache_key)
+    if cached is not None:
+        return cached
 
     end_date = datetime.now()
     start_date = end_date - timedelta(days=FRESH_INJURY_DAYS)
 
     url = (
-        "https://statsapi.mlb.com/api/v1/transactions"
+        f"{MLB_API_BASE}/v1/transactions"
         f"?playerId={player_id}"
         f"&startDate={start_date.strftime('%Y-%m-%d')}"
         f"&endDate={end_date.strftime('%Y-%m-%d')}"
     )
 
     try:
-        data = requests.get(url, timeout=10).json()
+        data = request_json("get", url)
         transactions = data.get("transactions", [])
 
         for tx in transactions:
@@ -276,18 +357,15 @@ def recently_reinstated_from_injury(player_id, player_name):
                 "injured" in desc or "injury" in desc or " il" in desc
             ):
                 result = True, desc[:120]
-                injury_cache[cache_key] = result
-                return result
+                return cache_set(injury_cache, cache_key, result, INJURY_CACHE_SECONDS)
 
         result = False, "No recent injury return found"
-        injury_cache[cache_key] = result
-        return result
+        return cache_set(injury_cache, cache_key, result, INJURY_CACHE_SECONDS)
 
-    except Exception as e:
-        print(f"Injury check error {player_name}:", e, flush=True)
+    except Exception as exc:
+        print(f"Injury check error {player_name}:", exc, flush=True)
         result = False, "Injury check unavailable"
-        injury_cache[cache_key] = result
-        return result
+        return cache_set(injury_cache, cache_key, result, 300)
 
 
 def calculate_batter_profile(stats):
@@ -298,7 +376,6 @@ def calculate_batter_profile(stats):
 
     hr = safe_int(stats.get("homeRuns"))
     rbi = safe_int(stats.get("rbi"))
-    hits = safe_int(stats.get("hits"))
     doubles = safe_int(stats.get("doubles"))
     triples = safe_int(stats.get("triples"))
     walks = safe_int(stats.get("baseOnBalls"))
@@ -317,41 +394,10 @@ def calculate_batter_profile(stats):
     xbh_rate = (doubles + triples + hr) / max(at_bats, 1)
 
     hit_score = 45 + (avg * 85) + (obp * 35) - (k_rate * 45)
-
-    hrr_score = (
-        45
-        + (avg * 55)
-        + (obp * 35)
-        + (slg * 25)
-        + (bb_rate * 25)
-        - (k_rate * 35)
-    )
-
-    rbi_score = (
-        45
-        + (obp * 25)
-        + (slg * 42)
-        + ((rbi / pa) * 110)
-        + (bb_rate * 25)
-        - (k_rate * 30)
-    )
-
-    total_bases_score = (
-        42
-        + (slg * 55)
-        + (ops * 18)
-        + (xbh_rate * 90)
-        - (k_rate * 22)
-    )
-
-    hr_score = (
-        35
-        + (hr_rate * 800)
-        + (slg * 38)
-        + (xbh_rate * 95)
-        + (ops * 12)
-        - (k_rate * 15)
-    )
+    hrr_score = 45 + (avg * 55) + (obp * 35) + (slg * 25) + (bb_rate * 25) - (k_rate * 35)
+    rbi_score = 45 + (obp * 25) + (slg * 42) + ((rbi / pa) * 110) + (bb_rate * 25) - (k_rate * 30)
+    total_bases_score = 42 + (slg * 55) + (ops * 18) + (xbh_rate * 90) - (k_rate * 22)
+    hr_score = 35 + (hr_rate * 800) + (slg * 38) + (xbh_rate * 95) + (ops * 12) - (k_rate * 15)
 
     return {
         "hit": clamp(hit_score),
@@ -381,7 +427,6 @@ def calculate_pitcher_profile(stats):
     hits = safe_int(stats.get("hits"))
 
     ip = max(innings, 1.0)
-
     hr9 = home_runs * 9 / ip
     bb9 = walks * 9 / ip
     k9 = strikeouts * 9 / ip
@@ -459,8 +504,15 @@ def calculate_outs_edge(outs):
 def event_is_runner_reached(event):
     event = (event or "").lower()
     return event in [
-        "single", "double", "triple", "home_run", "walk",
-        "hit_by_pitch", "field_error", "catcher_interf", "intent_walk"
+        "single",
+        "double",
+        "triple",
+        "home_run",
+        "walk",
+        "hit_by_pitch",
+        "field_error",
+        "catcher_interf",
+        "intent_walk",
     ]
 
 
@@ -574,13 +626,34 @@ def calculate_pressure_score(offense, pitcher, inning_pressure, outs, inning):
 
 
 def get_current_pitcher(data):
-    boxscore = data.get("liveData", {}).get("boxscore", {})
-    teams = boxscore.get("teams", {})
+    live_data = data.get("liveData", {})
+    plays = live_data.get("plays", {})
+    matchup_pitcher = (
+        plays.get("currentPlay", {})
+        .get("matchup", {})
+        .get("pitcher", {})
+    )
+    if matchup_pitcher.get("id"):
+        return {
+            "id": matchup_pitcher.get("id"),
+            "name": matchup_pitcher.get("fullName", "Unknown pitcher"),
+        }
+
+    defense_pitcher = live_data.get("linescore", {}).get("defense", {}).get("pitcher", {})
+    if defense_pitcher.get("id"):
+        return {
+            "id": defense_pitcher.get("id"),
+            "name": defense_pitcher.get("fullName", "Unknown pitcher"),
+        }
+
+    boxscore = live_data.get("boxscore", {})
+    defense_team_id = live_data.get("linescore", {}).get("defense", {}).get("team", {}).get("id")
 
     for side in ["away", "home"]:
-        players = teams.get(side, {}).get("players", {})
-
-        for _, player_data in players.items():
+        team = boxscore.get("teams", {}).get(side, {})
+        if defense_team_id and team.get("team", {}).get("id") != defense_team_id:
+            continue
+        for player_data in team.get("players", {}).values():
             position = player_data.get("position", {}).get("abbreviation", "")
             if position == "P":
                 person = player_data.get("person", {})
@@ -675,6 +748,7 @@ def score_player_target(target, pitcher, pressure_score):
     return {
         "target": target,
         "profile": profile,
+        "timing_boost": timing_boost,
         "hit": hit_market,
         "hrr": hrr_market,
         "rbi": rbi_market,
@@ -686,21 +760,21 @@ def score_player_target(target, pitcher, pressure_score):
 
 def market_path(market, team_name=None):
     if market == "Player Hits":
-        return "Live Player Props → Player Hits"
+        return "Live Player Props -> Player Hits"
     if market == "Player H+R+RBI":
-        return "Live Player Props → Player Hits+Runs+RBIs"
+        return "Live Player Props -> Player Hits+Runs+RBIs"
     if market == "Player RBI":
-        return "Live Player Props → Player RBIs"
+        return "Live Player Props -> Player RBIs"
     if market == "Player Total Bases":
-        return "Live Player Props → Player Total Bases"
+        return "Live Player Props -> Player Total Bases"
     if market == "Player Home Run":
-        return "Live Player Props → Player Home Runs"
+        return "Live Player Props -> Player Home Runs"
     if market == "Team Total Over":
-        return f"Hits and Runs → {team_name} Alt. Total Runs\nor Hits and Runs → Team Total Runs"
+        return f"Hits and Runs -> {team_name} Alt. Total Runs\nor Hits and Runs -> Team Total Runs"
     if market == "Inning Total Runs":
-        return "Innings → Inning Total Runs\nor Innings → All Innings O/U 0.5 Runs"
+        return "Innings -> Inning Total Runs\nor Innings -> All Innings O/U 0.5 Runs"
     if market == "Game Total Over":
-        return "Live SGP → Game Lines → Total → Over"
+        return "Live SGP -> Game Lines -> Total -> Over"
     return "Check Live Player Props, Hits and Runs, or Innings"
 
 
@@ -735,6 +809,7 @@ def build_market_lines(markets, team_name=None):
 
 def should_send_alert(key, score):
     now = time.time()
+    prune_sent_alerts(now)
     info = sent_alerts.get(key)
 
     if not info:
@@ -760,95 +835,108 @@ def should_send_alert(key, score):
     return True
 
 
-def build_get_ready_alert(team, target_score, pressure_score, game_spot, base_text, inning_pressure):
-    target = target_score["target"]
-    markets = top_player_markets(target_score)
-
+def format_score_debug(player_score, pitcher, pressure_score):
+    profile = player_score["profile"]
     return (
-        f"👀 GET READY ALERT\n\n"
-        f"Target Player:\n"
-        f"{target['name']} ({target['role']})\n\n"
-        f"Markets To Check Now:\n"
-        f"{build_market_lines(markets, team_name=team)}\n\n"
-        f"Team Fallback:\n"
-        f"{team} Team Total Over\n"
-        f"Find it: {market_path('Team Total Over', team_name=team)}\n"
-        f"Pressure Score: {display_score(pressure_score)}/100 {grade(pressure_score)}\n\n"
-        f"Game Spot:\n"
-        f"{team} batting\n"
-        f"{game_spot}\n"
-        f"{base_text}\n\n"
-        f"Why:\n"
-        f"• Target is {target['batters_away']} batters away, so props are more likely open\n"
-        f"• Pressure is building before the market fully locks\n"
-        f"• This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
-        f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached"
+        f"Debug: player avg/obp/slg {profile['avg']:.3f}/"
+        f"{profile['obp']:.3f}/{profile['slg']:.3f}; "
+        f"pitcher weakness {pitcher['weakness']}; "
+        f"pressure {pressure_score}; "
+        f"timing boost {player_score['timing_boost']}"
     )
 
 
-def build_matchup_alert(team, target_score, pitcher, game_spot, base_text):
+def build_get_ready_alert(team, target_score, pressure_score, game_spot, base_text, inning_pressure, pitcher):
     target = target_score["target"]
     markets = top_player_markets(target_score)
 
     return (
-        f"🔥 MATCHUP ALERT\n\n"
-        f"Target Player:\n"
+        "GET READY ALERT\n\n"
+        "Target Player:\n"
         f"{target['name']} ({target['role']})\n\n"
-        f"Markets To Check:\n"
+        "Markets To Check Now:\n"
         f"{build_market_lines(markets, team_name=team)}\n\n"
-        f"Game Spot:\n"
+        "Team Fallback:\n"
+        f"{team} Team Total Over\n"
+        f"Find it: {market_path('Team Total Over', team_name=team)}\n"
+        f"Pressure Score: {display_score(pressure_score)}/100 {grade(pressure_score)}\n\n"
+        "Game Spot:\n"
         f"{team} batting\n"
         f"{game_spot}\n"
         f"{base_text}\n\n"
-        f"Pitcher Weakness:\n"
+        "Why:\n"
+        f"- Target is {target['batters_away']} batters away, so props are more likely open\n"
+        "- Pressure is building before the market fully locks\n"
+        f"- This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
+        f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached\n"
+        f"- {format_score_debug(target_score, pitcher, pressure_score)}"
+    )
+
+
+def build_matchup_alert(team, target_score, pitcher, game_spot, base_text, pressure_score):
+    target = target_score["target"]
+    markets = top_player_markets(target_score)
+
+    return (
+        "MATCHUP ALERT\n\n"
+        "Target Player:\n"
+        f"{target['name']} ({target['role']})\n\n"
+        "Markets To Check:\n"
+        f"{build_market_lines(markets, team_name=team)}\n\n"
+        "Game Spot:\n"
+        f"{team} batting\n"
+        f"{game_spot}\n"
+        f"{base_text}\n\n"
+        "Pitcher Weakness:\n"
         f"{pitcher['weakness']} model points\n"
         f"ERA/WHIP: {pitcher['era']:.2f}/{pitcher['whip']:.2f}\n"
-        f"HR/9: {pitcher['hr9']:.2f} | BB/9: {pitcher['bb9']:.2f}"
+        f"HR/9: {pitcher['hr9']:.2f} | BB/9: {pitcher['bb9']:.2f}\n"
+        f"{format_score_debug(target_score, pitcher, pressure_score)}"
     )
 
 
 def build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pressure, best_targets):
     target_lines = []
 
-    for t in best_targets[:3]:
+    for target in best_targets[:3]:
         target_lines.append(
-            f"• {t['target']['name']} ({t['target']['role']}) — "
-            f"Best score {display_score(t['best_score'])}/100"
+            f"- {target['target']['name']} ({target['target']['role']}) - "
+            f"Best score {display_score(target['best_score'])}/100"
         )
 
     return (
-        f"⚠️ PRESSURE BUILDING\n\n"
-        f"Target Team:\n"
+        "PRESSURE BUILDING\n\n"
+        "Target Team:\n"
         f"{team}\n\n"
-        f"Markets To Check:\n"
+        "Markets To Check:\n"
         f"1. {team} Team Total Over\n"
         f"   Find it: {market_path('Team Total Over', team_name=team)}\n\n"
-        f"2. Current Inning Total Runs Over\n"
+        "2. Current Inning Total Runs Over\n"
         f"   Find it: {market_path('Inning Total Runs')}\n\n"
-        f"3. Game Total Over\n"
+        "3. Game Total Over\n"
         f"   Find it: {market_path('Game Total Over')}\n\n"
-        f"Potential Player Targets:\n"
+        "Potential Player Targets:\n"
         f"{chr(10).join(target_lines)}\n\n"
         f"Pressure Score: {display_score(pressure_score)}/100 {grade(pressure_score)}\n\n"
-        f"Game Spot:\n"
+        "Game Spot:\n"
         f"{team} batting\n"
         f"{game_spot}\n"
         f"{base_text}\n\n"
-        f"Why:\n"
-        f"• Pitcher/team pressure is rising\n"
-        f"• We are looking ahead in the batting order before props lock\n"
-        f"• This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
+        "Why:\n"
+        "- Pitcher/team pressure is rising\n"
+        "- We are looking ahead in the batting order before props lock\n"
+        f"- This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
         f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached"
     )
 
 
 def check_game(game_pk):
-    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+    url = f"{MLB_API_BASE}/v1.1/game/{game_pk}/feed/live"
 
     try:
-        data = requests.get(url, timeout=10).json()
-    except Exception as e:
-        print(f"Game feed error {game_pk}:", e, flush=True)
+        data = request_json("get", url)
+    except Exception as exc:
+        print(f"Game feed error {game_pk}:", exc, flush=True)
         return
 
     linescore = data.get("liveData", {}).get("linescore", {})
@@ -894,13 +982,13 @@ def check_game(game_pk):
             print(f"Skipping {target['name']}: injury risk - {injury_reason}", flush=True)
             continue
 
-        scored = score_player_target(
-            target=target,
-            pitcher=pitcher,
-            pressure_score=pressure_score,
+        scored_targets.append(
+            score_player_target(
+                target=target,
+                pitcher=pitcher,
+                pressure_score=pressure_score,
+            )
         )
-
-        scored_targets.append(scored)
 
     if not scored_targets:
         return
@@ -908,8 +996,9 @@ def check_game(game_pk):
     scored_targets.sort(key=lambda x: x["best_score"], reverse=True)
 
     early_targets = [
-        x for x in scored_targets
-        if safe_int(x["target"]["batters_away"]) >= MIN_TARGET_BATTERS_AWAY
+        target
+        for target in scored_targets
+        if safe_int(target["target"]["batters_away"]) >= MIN_TARGET_BATTERS_AWAY
     ]
 
     if not early_targets:
@@ -929,12 +1018,14 @@ def check_game(game_pk):
     if best_target["best_score"] >= MIN_GET_READY_SCORE and pressure_score >= 65:
         alert_type = "GET_READY"
         alert_score = best_target["best_score"]
-        msg = build_get_ready_alert(team, best_target, pressure_score, game_spot, base_text, inning_pressure)
+        msg = build_get_ready_alert(
+            team, best_target, pressure_score, game_spot, base_text, inning_pressure, pitcher
+        )
 
     elif best_target["best_score"] >= MIN_MATCHUP_SCORE:
         alert_type = "MATCHUP"
         alert_score = best_target["best_score"]
-        msg = build_matchup_alert(team, best_target, pitcher, game_spot, base_text)
+        msg = build_matchup_alert(team, best_target, pitcher, game_spot, base_text, pressure_score)
 
     elif pressure_score >= MIN_PRESSURE_SCORE:
         alert_type = "PRESSURE"
@@ -943,10 +1034,11 @@ def check_game(game_pk):
 
     if not msg:
         print(
-            f"{team} {game_spot} | Pressure {pressure_score} | "
-            f"Best early target {best_target['target']['name']} "
-            f"{best_target['target']['role']} {best_target['best_score']} | no alert",
-            flush=True
+            f"{team} {game_spot} | Pitcher {pitcher_obj['name']} | "
+            f"Pressure {pressure_score} | Best early target "
+            f"{best_target['target']['name']} {best_target['target']['role']} "
+            f"{best_target['best_score']} | {format_score_debug(best_target, pitcher, pressure_score)} | no alert",
+            flush=True,
         )
         return
 
@@ -957,16 +1049,22 @@ def check_game(game_pk):
         return
 
     print(
-        f"Sending {alert_type}: {team} | {best_target['target']['name']} "
-        f"({best_target['target']['role']}) | score {alert_score} | pressure {pressure_score}",
-        flush=True
+        f"Sending {alert_type}: {team} | Pitcher {pitcher_obj['name']} | "
+        f"{best_target['target']['name']} ({best_target['target']['role']}) | "
+        f"score {alert_score} | pressure {pressure_score}",
+        flush=True,
     )
 
     broadcast(msg)
 
 
 def main():
-    broadcast("✅ MLB Predictive Betting Alert Bot is live.")
+    global last_update_id
+
+    validate_config()
+    last_update_id = load_last_update_id()
+
+    broadcast("MLB Predictive Betting Alert Bot is live.")
 
     while True:
         try:
@@ -979,8 +1077,8 @@ def main():
                 if game_pk:
                     check_game(game_pk)
 
-        except Exception as e:
-            print("Main loop error:", e, flush=True)
+        except Exception as exc:
+            print("Main loop error:", exc, flush=True)
 
         time.sleep(POLL_SECONDS)
 
