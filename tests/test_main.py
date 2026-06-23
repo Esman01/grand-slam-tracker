@@ -1,4 +1,6 @@
 import importlib
+import os
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -55,6 +57,50 @@ class AlertThrottleTests(unittest.TestCase):
     def test_should_send_alert_suppresses_duplicate(self):
         self.assertTrue(main.should_send_alert("spot", 90))
         self.assertFalse(main.should_send_alert("spot", 91))
+
+
+class ResultTrackingTests(unittest.TestCase):
+    def test_make_alert_id_is_stable_for_alert_context(self):
+        now = main.datetime(2026, 6, 23, 12, 0, 0)
+
+        alert_id = main.make_alert_id(12345, 6, "top", "GET_READY", 67890, now=now)
+
+        self.assertEqual(alert_id, "0623-12345-6T-GR-67890")
+
+    def test_record_alert_outcome_updates_store(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                main.record_alert({
+                    "id": "alert-1",
+                    "sent_at": main.utc_now().isoformat(),
+                    "alert_type": "GET_READY",
+                    "target": "Test Player",
+                    "status": "open",
+                })
+
+                alert = main.record_alert_outcome("alert-1", "win", "123")
+
+                self.assertEqual(alert["status"], "win")
+                self.assertEqual(alert["reported_by"], "123")
+
+    def test_build_results_recap_includes_record(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                main.record_alert({
+                    "id": "alert-1",
+                    "sent_at": main.utc_now().isoformat(),
+                    "alert_type": "MATCHUP",
+                    "target": "Test Player",
+                    "status": "open",
+                })
+                main.record_alert_outcome("alert-1", "loss", "123")
+
+                recap = main.build_results_recap(days=1)
+
+                self.assertIn("Record: 0-1-0", recap)
+                self.assertIn("MATCHUP: 1", recap)
 
 
 class LiveFeedParsingTests(unittest.TestCase):
