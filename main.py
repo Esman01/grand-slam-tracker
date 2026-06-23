@@ -7,18 +7,17 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 SHEET_WEBHOOK_URL = os.environ["SHEET_WEBHOOK_URL"]
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "8"))
-
 ONLY_BASES_LOADED = os.getenv("ONLY_BASES_LOADED", "false").lower() == "true"
-ACTIONABLE_ONLY = os.getenv("ACTIONABLE_ONLY", "true").lower() == "true"
-ALLOW_FAST_LOCK_MARKETS = os.getenv("ALLOW_FAST_LOCK_MARKETS", "false").lower() == "true"
 
-ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "240"))
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
 MAX_ALERTS_PER_HALF_INNING = int(os.getenv("MAX_ALERTS_PER_HALF_INNING", "1"))
+
+LOOKAHEAD_BATTERS = int(os.getenv("LOOKAHEAD_BATTERS", "4"))
+MIN_TARGET_BATTERS_AWAY = int(os.getenv("MIN_TARGET_BATTERS_AWAY", "2"))
 
 MIN_GET_READY_SCORE = int(os.getenv("MIN_GET_READY_SCORE", "88"))
 MIN_MATCHUP_SCORE = int(os.getenv("MIN_MATCHUP_SCORE", "90"))
-MIN_PRESSURE_SCORE = int(os.getenv("MIN_PRESSURE_SCORE", "90"))
-MIN_LIVE_BET_SCORE = int(os.getenv("MIN_LIVE_BET_SCORE", "92"))
+MIN_PRESSURE_SCORE = int(os.getenv("MIN_PRESSURE_SCORE", "92"))
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 
@@ -114,13 +113,8 @@ def broadcast(msg):
 def subscription_message():
     return (
         "✅ Subscription Active\n\n"
-        "You’ll receive target-based MLB live betting alerts.\n\n"
-        "Alert types:\n"
-        "🚨 LIVE BET ALERT\n"
-        "👀 GET READY ALERT\n"
-        "🔥 MATCHUP ALERT\n"
-        "⚠️ PRESSURE BUILDING\n\n"
-        "Every player market will name the exact player to check.\n\n"
+        "You’ll receive predictive MLB live betting alerts.\n\n"
+        "The bot now looks 2–4 batters ahead using the live batting order so you have more time before markets lock.\n\n"
         "Commands:\n"
         "/status - check status\n"
         "/stop - stop alerts\n"
@@ -342,6 +336,14 @@ def calculate_batter_profile(stats):
         - (k_rate * 30)
     )
 
+    total_bases_score = (
+        42
+        + (slg * 55)
+        + (ops * 18)
+        + (xbh_rate * 90)
+        - (k_rate * 22)
+    )
+
     hr_score = (
         35
         + (hr_rate * 800)
@@ -351,29 +353,12 @@ def calculate_batter_profile(stats):
         - (k_rate * 15)
     )
 
-    total_bases_score = (
-        42
-        + (slg * 55)
-        + (ops * 18)
-        + (xbh_rate * 90)
-        - (k_rate * 22)
-    )
-
-    xbh_score = (
-        35
-        + (slg * 45)
-        + (xbh_rate * 140)
-        + (hr_rate * 300)
-        - (k_rate * 15)
-    )
-
     return {
         "hit": clamp(hit_score),
         "hrr": clamp(hrr_score),
         "rbi": clamp(rbi_score),
-        "hr": clamp(hr_score),
         "total_bases": clamp(total_bases_score),
-        "xbh": clamp(xbh_score),
+        "hr": clamp(hr_score),
         "avg": avg,
         "obp": obp,
         "slg": slg,
@@ -577,87 +562,115 @@ def calculate_pressure_score(offense, pitcher, inning_pressure, outs, inning):
     pressure += calculate_outs_edge(outs)
 
     inn = safe_int(inning)
+
     if 2 <= inn <= 6:
-        pressure += 8
+        pressure += 10
+    elif inn == 7:
+        pressure += 2
     elif inn >= 8:
-        pressure -= 7
+        pressure -= 10
 
     return clamp(pressure)
 
 
-def get_batting_order(data):
+def get_current_pitcher(data):
+    boxscore = data.get("liveData", {}).get("boxscore", {})
+    teams = boxscore.get("teams", {})
+
+    for side in ["away", "home"]:
+        players = teams.get(side, {}).get("players", {})
+
+        for _, player_data in players.items():
+            position = player_data.get("position", {}).get("abbreviation", "")
+            if position == "P":
+                person = player_data.get("person", {})
+                return {
+                    "id": person.get("id"),
+                    "name": person.get("fullName", "Unknown pitcher"),
+                }
+
+    return {"id": None, "name": "Unknown pitcher"}
+
+
+def get_batting_order_targets(data, lookahead=4):
     boxscore = data.get("liveData", {}).get("boxscore", {})
     linescore = data.get("liveData", {}).get("linescore", {})
-    offense_team_id = linescore.get("offense", {}).get("team", {}).get("id")
+    offense = linescore.get("offense", {})
+    current_batter_id = offense.get("batter", {}).get("id")
+    offense_team_id = offense.get("team", {}).get("id")
 
     teams = boxscore.get("teams", {})
+
+    batting_order = []
+    players = {}
 
     for side in ["away", "home"]:
         team = teams.get(side, {})
         team_id = team.get("team", {}).get("id")
 
-        if team_id != offense_team_id:
-            continue
+        if team_id == offense_team_id:
+            batting_order = team.get("battingOrder", [])
+            players = team.get("players", {})
+            break
 
-        batting_order_ids = team.get("battingOrder", [])
-        players = team.get("players", {})
+    if not batting_order or not current_batter_id:
+        return []
 
-        ordered = []
-        for pid in batting_order_ids:
-            pdata = players.get(f"ID{pid}", {})
-            person = pdata.get("person", {})
-            ordered.append({
-                "id": person.get("id"),
-                "name": person.get("fullName", "Unknown"),
-            })
+    order_ids = [safe_int(x) for x in batting_order]
 
-        return ordered
+    try:
+        current_index = order_ids.index(safe_int(current_batter_id))
+    except ValueError:
+        return []
 
-    return []
+    targets = []
 
+    for offset in range(1, lookahead + 1):
+        idx = (current_index + offset) % len(order_ids)
+        pid = order_ids[idx]
+        pdata = players.get(f"ID{pid}", {})
+        person = pdata.get("person", {})
 
-def get_targets(data):
-    linescore = data.get("liveData", {}).get("linescore", {})
-    offense = linescore.get("offense", {})
+        if offset == 1:
+            role = "On Deck"
+        elif offset == 2:
+            role = "2 Batters Away"
+        elif offset == 3:
+            role = "3 Batters Away"
+        else:
+            role = f"{offset} Batters Away"
 
-    current = {
-        "role": "At Bat",
-        "id": offense.get("batter", {}).get("id"),
-        "name": offense.get("batter", {}).get("fullName", "Unknown batter"),
-    }
+        targets.append({
+            "id": person.get("id", pid),
+            "name": person.get("fullName", "Unknown"),
+            "role": role,
+            "batters_away": offset,
+        })
 
-    on_deck = {
-        "role": "On Deck",
-        "id": offense.get("onDeck", {}).get("id"),
-        "name": offense.get("onDeck", {}).get("fullName", "Unknown"),
-    }
-
-    in_hole = {
-        "role": "In Hole",
-        "id": offense.get("inHole", {}).get("id"),
-        "name": offense.get("inHole", {}).get("fullName", "Unknown"),
-    }
-
-    return [current, on_deck, in_hole]
+    return targets
 
 
-def score_player_target(target, pitcher, pressure_score, count_edge, role):
+def score_player_target(target, pitcher, pressure_score):
     stats = get_player_season_stats(target["id"], "hitting")
     profile = calculate_batter_profile(stats)
 
-    role_boost = 0
-    if role == "At Bat":
-        role_boost = 2
-    elif role == "On Deck":
-        role_boost = 8
-    elif role == "In Hole":
-        role_boost = 5
+    away = safe_int(target.get("batters_away", 1))
 
-    hit_market = clamp(profile["hit"] + pitcher["weakness"] * 0.55 + pressure_score * 0.20 + role_boost + count_edge)
-    hrr_market = clamp(profile["hrr"] + pitcher["weakness"] * 0.55 + pressure_score * 0.25 + role_boost)
-    rbi_market = clamp(profile["rbi"] + pitcher["weakness"] * 0.60 + pressure_score * 0.30 + role_boost)
-    tb_market = clamp(profile["total_bases"] + pitcher["weakness"] * 0.55 + pressure_score * 0.20 + role_boost)
-    hr_market = clamp(profile["hr"] + pitcher["weakness"] * 0.45 + pressure_score * 0.12 + role_boost)
+    timing_boost = 0
+    if away == 2:
+        timing_boost = 10
+    elif away == 3:
+        timing_boost = 8
+    elif away == 4:
+        timing_boost = 5
+    elif away == 1:
+        timing_boost = -4
+
+    hit_market = clamp(profile["hit"] + pitcher["weakness"] * 0.55 + pressure_score * 0.18 + timing_boost)
+    hrr_market = clamp(profile["hrr"] + pitcher["weakness"] * 0.55 + pressure_score * 0.23 + timing_boost)
+    rbi_market = clamp(profile["rbi"] + pitcher["weakness"] * 0.60 + pressure_score * 0.24 + timing_boost)
+    tb_market = clamp(profile["total_bases"] + pitcher["weakness"] * 0.55 + pressure_score * 0.18 + timing_boost)
+    hr_market = clamp(profile["hr"] + pitcher["weakness"] * 0.45 + pressure_score * 0.10 + timing_boost)
 
     return {
         "target": target,
@@ -671,7 +684,7 @@ def score_player_target(target, pitcher, pressure_score, count_edge, role):
     }
 
 
-def market_path(market, player_name=None, team_name=None):
+def market_path(market, team_name=None):
     if market == "Player Hits":
         return "Live Player Props → Player Hits"
     if market == "Player H+R+RBI":
@@ -686,8 +699,6 @@ def market_path(market, player_name=None, team_name=None):
         return f"Hits and Runs → {team_name} Alt. Total Runs\nor Hits and Runs → Team Total Runs"
     if market == "Inning Total Runs":
         return "Innings → Inning Total Runs\nor Innings → All Innings O/U 0.5 Runs"
-    if market == "Team To Score This Inning":
-        return "Innings → Inning Total Runs\nor Live Specials → Team To Score This Inning"
     if market == "Game Total Over":
         return "Live SGP → Game Lines → Total → Over"
     return "Check Live Player Props, Hits and Runs, or Innings"
@@ -757,7 +768,7 @@ def build_get_ready_alert(team, target_score, pressure_score, game_spot, base_te
         f"👀 GET READY ALERT\n\n"
         f"Target Player:\n"
         f"{target['name']} ({target['role']})\n\n"
-        f"Markets To Check:\n"
+        f"Markets To Check Now:\n"
         f"{build_market_lines(markets, team_name=team)}\n\n"
         f"Team Fallback:\n"
         f"{team} Team Total Over\n"
@@ -768,14 +779,14 @@ def build_get_ready_alert(team, target_score, pressure_score, game_spot, base_te
         f"{game_spot}\n"
         f"{base_text}\n\n"
         f"Why:\n"
-        f"• Target is due up soon, so player props are more likely to still be open\n"
-        f"• Pressure is building before the book fully locks markets\n"
+        f"• Target is {target['batters_away']} batters away, so props are more likely open\n"
+        f"• Pressure is building before the market fully locks\n"
         f"• This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
         f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached"
     )
 
 
-def build_matchup_alert(team, target_score, pitcher, game_spot):
+def build_matchup_alert(team, target_score, pitcher, game_spot, base_text):
     target = target_score["target"]
     markets = top_player_markets(target_score)
 
@@ -785,17 +796,26 @@ def build_matchup_alert(team, target_score, pitcher, game_spot):
         f"{target['name']} ({target['role']})\n\n"
         f"Markets To Check:\n"
         f"{build_market_lines(markets, team_name=team)}\n\n"
+        f"Game Spot:\n"
+        f"{team} batting\n"
+        f"{game_spot}\n"
+        f"{base_text}\n\n"
         f"Pitcher Weakness:\n"
         f"{pitcher['weakness']} model points\n"
         f"ERA/WHIP: {pitcher['era']:.2f}/{pitcher['whip']:.2f}\n"
-        f"HR/9: {pitcher['hr9']:.2f} | BB/9: {pitcher['bb9']:.2f}\n\n"
-        f"Game Spot:\n"
-        f"{team} batting\n"
-        f"{game_spot}"
+        f"HR/9: {pitcher['hr9']:.2f} | BB/9: {pitcher['bb9']:.2f}"
     )
 
 
-def build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pressure):
+def build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pressure, best_targets):
+    target_lines = []
+
+    for t in best_targets[:3]:
+        target_lines.append(
+            f"• {t['target']['name']} ({t['target']['role']}) — "
+            f"Best score {display_score(t['best_score'])}/100"
+        )
+
     return (
         f"⚠️ PRESSURE BUILDING\n\n"
         f"Target Team:\n"
@@ -807,6 +827,8 @@ def build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pres
         f"   Find it: {market_path('Inning Total Runs')}\n\n"
         f"3. Game Total Over\n"
         f"   Find it: {market_path('Game Total Over')}\n\n"
+        f"Potential Player Targets:\n"
+        f"{chr(10).join(target_lines)}\n\n"
         f"Pressure Score: {display_score(pressure_score)}/100 {grade(pressure_score)}\n\n"
         f"Game Spot:\n"
         f"{team} batting\n"
@@ -814,7 +836,7 @@ def build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pres
         f"{base_text}\n\n"
         f"Why:\n"
         f"• Pitcher/team pressure is rising\n"
-        f"• Better to check broader markets before the obvious player props lock\n"
+        f"• We are looking ahead in the batting order before props lock\n"
         f"• This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
         f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached"
     )
@@ -859,9 +881,10 @@ def check_game(game_pk):
     inning_pressure = get_inning_pressure(data, inning, half)
     pressure_score = calculate_pressure_score(offense, pitcher, inning_pressure, outs, inning)
 
-    targets = get_targets(data)
+    targets = get_batting_order_targets(data, LOOKAHEAD_BATTERS)
 
     scored_targets = []
+
     for target in targets:
         if not target["id"] or target["name"] == "Unknown":
             continue
@@ -875,84 +898,71 @@ def check_game(game_pk):
             target=target,
             pitcher=pitcher,
             pressure_score=pressure_score,
-            count_edge=calculate_count_edge(balls, strikes) if target["role"] == "At Bat" else 0,
-            role=target["role"],
         )
+
         scored_targets.append(scored)
 
     if not scored_targets:
         return
 
     scored_targets.sort(key=lambda x: x["best_score"], reverse=True)
-    best_target = scored_targets[0]
+
+    early_targets = [
+        x for x in scored_targets
+        if safe_int(x["target"]["batters_away"]) >= MIN_TARGET_BATTERS_AWAY
+    ]
+
+    if not early_targets:
+        print(f"{team}: no early targets available", flush=True)
+        return
+
+    early_targets.sort(key=lambda x: x["best_score"], reverse=True)
+    best_target = early_targets[0]
 
     game_spot = f"{half_display} {inning_display} | {outs} outs | Count {balls}-{strikes}"
     base_text = runners_summary(offense)
 
+    msg = None
     alert_type = None
     alert_score = 0
-    msg = None
 
-    # Predictive alerts first: on-deck/in-hole before market lock.
-    future_targets = [x for x in scored_targets if x["target"]["role"] in ["On Deck", "In Hole"]]
-    future_targets.sort(key=lambda x: x["best_score"], reverse=True)
-
-    if future_targets and future_targets[0]["best_score"] >= MIN_GET_READY_SCORE and pressure_score >= 70:
-        target = future_targets[0]
+    if best_target["best_score"] >= MIN_GET_READY_SCORE and pressure_score >= 65:
         alert_type = "GET_READY"
-        alert_score = target["best_score"]
-        msg = build_get_ready_alert(team, target, pressure_score, game_spot, base_text, inning_pressure)
+        alert_score = best_target["best_score"]
+        msg = build_get_ready_alert(team, best_target, pressure_score, game_spot, base_text, inning_pressure)
 
-    elif best_target["best_score"] >= MIN_MATCHUP_SCORE and pressure_score >= 55:
+    elif best_target["best_score"] >= MIN_MATCHUP_SCORE:
         alert_type = "MATCHUP"
         alert_score = best_target["best_score"]
-        msg = build_matchup_alert(team, best_target, pitcher, game_spot)
+        msg = build_matchup_alert(team, best_target, pitcher, game_spot, base_text)
 
     elif pressure_score >= MIN_PRESSURE_SCORE:
         alert_type = "PRESSURE"
         alert_score = pressure_score
-        msg = build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pressure)
+        msg = build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pressure, early_targets)
 
     if not msg:
         print(
             f"{team} {game_spot} | Pressure {pressure_score} | "
-            f"Best {best_target['target']['name']} {best_target['best_score']} | no alert",
+            f"Best early target {best_target['target']['name']} "
+            f"{best_target['target']['role']} {best_target['best_score']} | no alert",
             flush=True
         )
         return
 
-    spot_key = f"{game_pk}-{inning}-{half}-{team}-{alert_type}"
+    spot_key = f"{game_pk}-{inning}-{half}-{team}-{alert_type}-{best_target['target']['id']}"
 
     if not should_send_alert(spot_key, alert_score):
         print(f"Skipping duplicate/cooldown: {spot_key}", flush=True)
         return
 
     print(
-        f"Sending {alert_type}: {team} | {best_target['target']['name']} | "
-        f"score {alert_score} | pressure {pressure_score}",
+        f"Sending {alert_type}: {team} | {best_target['target']['name']} "
+        f"({best_target['target']['role']}) | score {alert_score} | pressure {pressure_score}",
         flush=True
     )
 
     broadcast(msg)
-
-
-def get_current_pitcher(data):
-    boxscore = data.get("liveData", {}).get("boxscore", {})
-    teams = boxscore.get("teams", {})
-
-    for side in ["away", "home"]:
-        players = teams.get(side, {}).get("players", {})
-
-        for _, player_data in players.items():
-            position = player_data.get("position", {}).get("abbreviation", "")
-            if position == "P":
-                person = player_data.get("person", {})
-                return {
-                    "id": person.get("id"),
-                    "name": person.get("fullName", "Unknown pitcher"),
-                }
-
-    return {"id": None, "name": "Unknown pitcher"}
 
 
 def main():
