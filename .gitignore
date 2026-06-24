@@ -5,4 +5,5 @@ __pycache__/
 .pytest_cache/
 .telegram_offset
 alert_results.json
+candidate_log.json
 subscribers.txt

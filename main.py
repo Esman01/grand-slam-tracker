@@ -18,25 +18,41 @@ ONLY_BASES_LOADED = os.getenv("ONLY_BASES_LOADED", "false").lower() == "true"
 ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
 MAX_ALERTS_PER_HALF_INNING = int(os.getenv("MAX_ALERTS_PER_HALF_INNING", "1"))
 ALERT_MEMORY_SECONDS = int(os.getenv("ALERT_MEMORY_SECONDS", "14400"))
+MAX_ALERTS_PER_GAME = int(os.getenv("MAX_ALERTS_PER_GAME", "2"))
+MAX_ALERTS_PER_TEAM_PER_GAME = int(os.getenv("MAX_ALERTS_PER_TEAM_PER_GAME", "1"))
+MAX_ALERTS_PER_PLAYER_PER_GAME = int(os.getenv("MAX_ALERTS_PER_PLAYER_PER_GAME", "1"))
+GLOBAL_ALERT_COOLDOWN_SECONDS = int(os.getenv("GLOBAL_ALERT_COOLDOWN_SECONDS", "600"))
+PLAYER_SCORE_IMPROVEMENT = int(os.getenv("PLAYER_SCORE_IMPROVEMENT", "10"))
 
 LOOKAHEAD_BATTERS = int(os.getenv("LOOKAHEAD_BATTERS", "4"))
 MIN_TARGET_BATTERS_AWAY = int(os.getenv("MIN_TARGET_BATTERS_AWAY", "2"))
+MAX_TARGET_BATTERS_AWAY = int(os.getenv("MAX_TARGET_BATTERS_AWAY", "4"))
+PREFERRED_MARKET_DISTANCE = int(os.getenv("PREFERRED_MARKET_DISTANCE", "3"))
 
 MIN_GET_READY_SCORE = int(os.getenv("MIN_GET_READY_SCORE", "90"))
-MIN_MATCHUP_SCORE = int(os.getenv("MIN_MATCHUP_SCORE", "90"))
-MIN_PRESSURE_SCORE = int(os.getenv("MIN_PRESSURE_SCORE", "92"))
+MIN_MATCHUP_SCORE = int(os.getenv("MIN_MATCHUP_SCORE", "92"))
+MIN_PRESSURE_SCORE = int(os.getenv("MIN_PRESSURE_SCORE", "90"))
 MIN_PLAYER_MARKET_SCORE = int(os.getenv("MIN_PLAYER_MARKET_SCORE", "90"))
 MIN_MATCHUP_MARKET_SCORE = int(os.getenv("MIN_MATCHUP_MARKET_SCORE", "92"))
-MIN_ALERT_PRESSURE_SCORE = int(os.getenv("MIN_ALERT_PRESSURE_SCORE", "40"))
+MIN_ALERT_PRESSURE_SCORE = int(os.getenv("MIN_ALERT_PRESSURE_SCORE", "60"))
 STRONG_PITCHER_PRESSURE_SCORE = int(os.getenv("STRONG_PITCHER_PRESSURE_SCORE", "75"))
 MAX_MARKETS_PER_ALERT = int(os.getenv("MAX_MARKETS_PER_ALERT", "2"))
 SECONDARY_MARKET_MAX_DROP = int(os.getenv("SECONDARY_MARKET_MAX_DROP", "4"))
+MIN_MARKET_DISPLAY_SCORE = int(os.getenv("MIN_MARKET_DISPLAY_SCORE", "88"))
+MIN_PLAYER_OPS = float(os.getenv("MIN_PLAYER_OPS", ".750"))
+MIN_PLAYER_SLG = float(os.getenv("MIN_PLAYER_SLG", ".400"))
+MIN_PLAYER_PA = int(os.getenv("MIN_PLAYER_PA", "80"))
+MIN_POWER_SLG_FOR_HR = float(os.getenv("MIN_POWER_SLG_FOR_HR", ".450"))
+MIN_POWER_HR_RATE = float(os.getenv("MIN_POWER_HR_RATE", ".035"))
+SEND_SILVER_ALERTS = os.getenv("SEND_SILVER_ALERTS", "false").lower() == "true"
+SHOW_DEBUG = os.getenv("SHOW_DEBUG", "false").lower() == "true"
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 STATS_CACHE_SECONDS = int(os.getenv("STATS_CACHE_SECONDS", "900"))
 INJURY_CACHE_SECONDS = int(os.getenv("INJURY_CACHE_SECONDS", "3600"))
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", ".telegram_offset")
 RESULTS_FILE = os.getenv("RESULTS_FILE", "alert_results.json")
+CANDIDATE_LOG_FILE = os.getenv("CANDIDATE_LOG_FILE", "candidate_log.json")
 RESULTS_RECAP_DAYS = int(os.getenv("RESULTS_RECAP_DAYS", "1"))
 MAX_RECAP_ITEMS = int(os.getenv("MAX_RECAP_ITEMS", "5"))
 
@@ -47,6 +63,10 @@ RECENT_INJURY_NAMES = [
 ]
 
 sent_alerts = {}
+game_alerts = {}
+team_game_alerts = {}
+player_game_alerts = {}
+last_global_alert_time = 0
 player_stats_cache = {}
 injury_cache = {}
 last_update_id = None
@@ -96,6 +116,19 @@ def safe_int(value, default=0):
 
 def clamp(value, low=0, high=100):
     return max(low, min(high, round(value)))
+
+
+def normalize_score(raw_score):
+    raw = safe_float(raw_score)
+    if raw >= 112:
+        return 95
+    if raw >= 104:
+        return 92 + ((raw - 104) / 8 * 3)
+    if raw >= 92:
+        return 86 + ((raw - 92) / 12 * 6)
+    if raw >= 78:
+        return 72 + ((raw - 78) / 14 * 14)
+    return raw * 0.92
 
 
 def display_score(score):
@@ -208,6 +241,42 @@ def save_result_store(store):
         print("Results store write error:", exc, flush=True)
 
 
+def load_json_list(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"{path} read error:", exc, flush=True)
+        return []
+
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("candidates"), list):
+        return data["candidates"]
+    return []
+
+
+def save_json_list(path, items):
+    temp_file = f"{path}.tmp"
+    try:
+        with open(temp_file, "w", encoding="utf-8") as handle:
+            json.dump(items, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temp_file, path)
+    except OSError as exc:
+        print(f"{path} write error:", exc, flush=True)
+
+
+def record_candidate(candidate):
+    candidates = load_json_list(CANDIDATE_LOG_FILE)
+    candidates.append(candidate)
+    if len(candidates) > 2000:
+        candidates = candidates[-2000:]
+    save_json_list(CANDIDATE_LOG_FILE, candidates)
+
+
 def post_sheet_event(payload):
     try:
         data = request_json("post", SHEET_WEBHOOK_URL, json=payload)
@@ -276,17 +345,27 @@ def summarize_results(days=1, now=None):
     cutoff = now - timedelta(days=days)
     summary = {
         "total": 0,
+        "sent": 0,
         "open": 0,
         "win": 0,
         "loss": 0,
         "push": 0,
         "no_market": 0,
         "by_type": {},
+        "by_market": {},
+        "skipped_reasons": {},
+        "winner_scores": [],
+        "loser_scores": [],
         "recent": [],
     }
 
+    alerts = [
+        alert
+        for alert in load_result_store().get("alerts", [])
+        if alert.get("sent", True) is True
+    ]
     alerts = sorted(
-        load_result_store().get("alerts", []),
+        alerts,
         key=lambda item: parse_iso_datetime(item.get("sent_at")),
         reverse=True,
     )
@@ -298,12 +377,40 @@ def summarize_results(days=1, now=None):
 
         status = alert.get("status", "open")
         alert_type = alert.get("alert_type", "UNKNOWN")
+        market = alert.get("best_market") or (
+            alert.get("markets", ["UNKNOWN"])[0] if alert.get("markets") else "UNKNOWN"
+        )
         summary["total"] += 1
+        summary["sent"] += 1
         summary[status] = summary.get(status, 0) + 1
-        summary["by_type"][alert_type] = summary["by_type"].get(alert_type, 0) + 1
+        type_summary = summary["by_type"].setdefault(
+            alert_type,
+            {"total": 0, "win": 0, "loss": 0, "push": 0, "no_market": 0},
+        )
+        type_summary["total"] += 1
+        if status in type_summary:
+            type_summary[status] += 1
+        market_summary = summary["by_market"].setdefault(
+            market,
+            {"total": 0, "win": 0, "loss": 0, "push": 0, "no_market": 0},
+        )
+        market_summary["total"] += 1
+        if status in market_summary:
+            market_summary[status] += 1
+        if status == "win":
+            summary["winner_scores"].append(safe_float(alert.get("score")))
+        if status == "loss":
+            summary["loser_scores"].append(safe_float(alert.get("score")))
 
         if len(summary["recent"]) < MAX_RECAP_ITEMS:
             summary["recent"].append(alert)
+
+    for candidate in load_json_list(CANDIDATE_LOG_FILE):
+        timestamp = parse_iso_datetime(candidate.get("timestamp"))
+        if timestamp < cutoff or candidate.get("sent") is True:
+            continue
+        reason = candidate.get("skip_reason") or "unknown"
+        summary["skipped_reasons"][reason] = summary["skipped_reasons"].get(reason, 0) + 1
 
     return summary
 
@@ -316,7 +423,7 @@ def build_results_recap(days=RESULTS_RECAP_DAYS):
     lines = [
         f"Results recap: last {days} day(s)",
         "",
-        f"Tracked alerts: {summary['total']}",
+        f"Sent alerts: {summary['sent']}",
         f"Record: {summary['win']}-{summary['loss']}-{summary['push']}",
         f"No market/locked: {summary['no_market']}",
         f"Still open: {summary['open']}",
@@ -324,11 +431,57 @@ def build_results_recap(days=RESULTS_RECAP_DAYS):
     ]
 
     if summary["by_type"]:
-        type_lines = [
-            f"{alert_type}: {count}"
-            for alert_type, count in sorted(summary["by_type"].items())
-        ]
+        type_lines = []
+        for alert_type, info in sorted(summary["by_type"].items()):
+            type_graded = info["win"] + info["loss"]
+            type_win_rate = (info["win"] / type_graded * 100) if type_graded else 0
+            if type_graded:
+                type_lines.append(f"{alert_type}: {type_win_rate:.1f}% win ({info['total']} sent)")
+            else:
+                type_lines.append(f"{alert_type}: no graded bets ({info['total']} sent)")
         lines.extend(["", "By alert type:", "\n".join(type_lines)])
+
+    if summary["by_market"]:
+        market_lines = []
+        for market, info in sorted(summary["by_market"].items()):
+            market_graded = info["win"] + info["loss"]
+            market_win_rate = (info["win"] / market_graded * 100) if market_graded else 0
+            nomarket_rate = (info["no_market"] / info["total"] * 100) if info["total"] else 0
+            if market_graded:
+                market_lines.append(
+                    f"{market}: {market_win_rate:.1f}% win | {nomarket_rate:.1f}% nomarket"
+                )
+            else:
+                market_lines.append(f"{market}: no graded bets | {nomarket_rate:.1f}% nomarket")
+        lines.extend(["", "By market:", "\n".join(market_lines)])
+
+    if summary["skipped_reasons"]:
+        skipped_lines = [
+            f"{reason}: {count}"
+            for reason, count in sorted(
+                summary["skipped_reasons"].items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:5]
+        ]
+        lines.extend(["", "Top skipped reasons:", "\n".join(skipped_lines)])
+
+    if summary["winner_scores"] or summary["loser_scores"]:
+        avg_win = (
+            sum(summary["winner_scores"]) / len(summary["winner_scores"])
+            if summary["winner_scores"]
+            else 0
+        )
+        avg_loss = (
+            sum(summary["loser_scores"]) / len(summary["loser_scores"])
+            if summary["loser_scores"]
+            else 0
+        )
+        lines.extend([
+            "",
+            f"Avg score winners: {avg_win:.1f}" if avg_win else "Avg score winners: n/a",
+            f"Avg score losers: {avg_loss:.1f}" if avg_loss else "Avg score losers: n/a",
+        ])
 
     if summary["recent"]:
         recent_lines = [
@@ -346,6 +499,7 @@ def build_pending_alerts(limit=MAX_RECAP_ITEMS):
         alert
         for alert in load_result_store().get("alerts", [])
         if alert.get("status", "open") == "open"
+        and alert.get("sent", True) is True
     ]
     alerts.sort(key=lambda item: parse_iso_datetime(item.get("sent_at")), reverse=True)
 
@@ -689,6 +843,8 @@ def calculate_batter_profile(stats):
         "ops": ops,
         "hr_count": hr,
         "rbi_count": rbi,
+        "hr_rate": hr_rate,
+        "xbh_rate": xbh_rate,
         "k_rate": k_rate,
         "bb_rate": bb_rate,
         "pa": pa,
@@ -705,6 +861,7 @@ def calculate_pitcher_profile(stats):
     hits = safe_int(stats.get("hits"))
 
     ip = max(innings, 1.0)
+    reliable = innings >= 15 and not (era == 0 and whip == 0)
     hr9 = home_runs * 9 / ip
     bb9 = walks * 9 / ip
     k9 = strikeouts * 9 / ip
@@ -741,10 +898,15 @@ def calculate_pitcher_profile(stats):
     elif hr9 <= 0.80:
         weakness -= 7
 
+    if not reliable:
+        weakness -= 8
+
     return {
         "weakness": weakness,
         "era": era,
         "whip": whip,
+        "ip": innings,
+        "reliable": reliable,
         "hr9": hr9,
         "bb9": bb9,
         "k9": k9,
@@ -1001,32 +1163,94 @@ def get_batting_order_targets(data, lookahead=4):
     return targets
 
 
-def score_player_target(target, pitcher, pressure_score):
+def player_quality_gate(profile):
+    return (
+        profile["ops"] >= MIN_PLAYER_OPS
+        and profile["slg"] >= MIN_PLAYER_SLG
+        and profile["pa"] >= MIN_PLAYER_PA
+    )
+
+
+def has_power_profile(profile):
+    return profile["slg"] >= MIN_POWER_SLG_FOR_HR or profile["hr_rate"] >= MIN_POWER_HR_RATE
+
+
+def has_elite_player_profile(profile):
+    return (
+        profile["ops"] >= .850
+        or profile["slg"] >= .500
+        or profile["avg"] >= .290
+        or has_power_profile(profile)
+    )
+
+
+def runners_likely_for_target(offense, inning_pressure):
+    return has_runners_on(offense) or inning_pressure.get("consecutive_reached", 0) >= 2
+
+
+def apply_score_context(raw_score, profile, pitcher, pressure_score, offense, inning):
+    score = safe_float(raw_score)
+
+    if pitcher["weakness"] < 0:
+        score += pitcher["weakness"] * 0.65
+    if not has_runners_on(offense):
+        score -= 5
+    if pressure_score < 60:
+        score -= 8
+    if profile["ops"] < MIN_PLAYER_OPS:
+        score -= 7
+    if profile["slg"] < MIN_PLAYER_SLG:
+        score -= 7
+    if safe_int(inning) == 1 and not has_runners_on(offense):
+        score -= 6
+    if not pitcher.get("reliable", True):
+        score -= 8
+
+    return normalize_score(score)
+
+
+def score_player_target(target, pitcher, pressure_score, offense=None, inning=0, inning_pressure=None):
+    offense = offense or {}
+    inning_pressure = inning_pressure or {}
     stats = get_player_season_stats(target["id"], "hitting")
     profile = calculate_batter_profile(stats)
 
     away = safe_int(target.get("batters_away", 1))
 
     timing_boost = 0
-    if away == 2:
+    if away == PREFERRED_MARKET_DISTANCE:
         timing_boost = 10
-    elif away == 3:
-        timing_boost = 8
+    elif away == 2:
+        timing_boost = 6
     elif away == 4:
         timing_boost = 5
     elif away == 1:
-        timing_boost = -4
+        timing_boost = -10
 
-    hit_market = clamp(profile["hit"] + pitcher["weakness"] * 0.55 + pressure_score * 0.18 + timing_boost)
-    hrr_market = clamp(profile["hrr"] + pitcher["weakness"] * 0.55 + pressure_score * 0.23 + timing_boost)
-    rbi_market = clamp(profile["rbi"] + pitcher["weakness"] * 0.60 + pressure_score * 0.24 + timing_boost)
-    tb_market = clamp(profile["total_bases"] + pitcher["weakness"] * 0.55 + pressure_score * 0.18 + timing_boost)
-    hr_market = clamp(profile["hr"] + pitcher["weakness"] * 0.45 + pressure_score * 0.10 + timing_boost)
+    raw_hit = profile["hit"] + pitcher["weakness"] * 0.45 + pressure_score * 0.14 + timing_boost
+    raw_hrr = profile["hrr"] + pitcher["weakness"] * 0.45 + pressure_score * 0.18 + timing_boost
+    raw_rbi = profile["rbi"] + pitcher["weakness"] * 0.50 + pressure_score * 0.20 + timing_boost
+    raw_tb = profile["total_bases"] + pitcher["weakness"] * 0.45 + pressure_score * 0.14 + timing_boost
+    raw_hr = profile["hr"] + pitcher["weakness"] * 0.35 + pressure_score * 0.08 + timing_boost
+
+    hit_market = apply_score_context(raw_hit, profile, pitcher, pressure_score, offense, inning)
+    hrr_market = apply_score_context(raw_hrr, profile, pitcher, pressure_score, offense, inning)
+    rbi_market = apply_score_context(raw_rbi, profile, pitcher, pressure_score, offense, inning)
+    tb_market = apply_score_context(raw_tb, profile, pitcher, pressure_score, offense, inning)
+    hr_market = apply_score_context(raw_hr, profile, pitcher, pressure_score, offense, inning)
+
+    if not has_power_profile(profile):
+        hr_market = min(hr_market, 88)
+    if not runners_likely_for_target(offense, inning_pressure):
+        rbi_market = min(rbi_market, 88)
 
     return {
         "target": target,
         "profile": profile,
         "timing_boost": timing_boost,
+        "quality_gate": player_quality_gate(profile),
+        "power_profile": has_power_profile(profile),
+        "elite_profile": has_elite_player_profile(profile),
         "hit": hit_market,
         "hrr": hrr_market,
         "rbi": rbi_market,
@@ -1070,25 +1294,24 @@ def top_player_markets(
 
     markets = [
         ("Player H+R+RBI", player_score["hrr"], f"{name} Hits+Runs+RBIs"),
-        ("Player Hits", player_score["hit"], f"{name} 1+ Hit"),
         ("Player Total Bases", player_score["total_bases"], f"{name} Total Bases Over"),
+        ("Player Hits", player_score["hit"], f"{name} 1+ Hit"),
         ("Player RBI", player_score["rbi"], f"{name} RBI"),
         ("Player Home Run", player_score["hr"], f"{name} Home Run"),
     ]
 
-    markets.sort(key=lambda x: x[1], reverse=True)
-
     filtered = []
-    best_score = None
+    best_score = max((score for _, score, _ in markets), default=0)
 
     for market, score, label in markets:
-        if score < min_score:
+        if score < max(min_score, MIN_MARKET_DISPLAY_SCORE):
             continue
         if market in ["Player RBI", "Player Home Run"] and not runners_on:
             continue
-        if best_score is None:
-            best_score = score
-        elif best_score - score > SECONDARY_MARKET_MAX_DROP:
+        if market == "Player Home Run":
+            if score < 94 or not player_score.get("power_profile"):
+                continue
+        if best_score - score > SECONDARY_MARKET_MAX_DROP:
             continue
         filtered.append((market, score, label))
         if len(filtered) >= max_markets:
@@ -1121,6 +1344,89 @@ def pitcher_context_allows_alert(pitcher, pressure_score, bases_loaded):
     return False
 
 
+def alert_tier(score, pressure_score, alert_type):
+    score = display_score(score)
+    pressure_score = display_score(pressure_score)
+    if alert_type == "LIVE_BET" or score >= 94 or pressure_score >= 94:
+        return "GOLD"
+    if alert_type == "PRESSURE" and pressure_score >= MIN_PRESSURE_SCORE:
+        return "GOLD"
+    if score >= 92 and pressure_score >= 75:
+        return "GOLD"
+    if score >= 90:
+        return "SILVER"
+    return "WATCHLIST"
+
+
+def market_confidence(score):
+    shown = display_score(score)
+    if shown >= 94:
+        return "Elite"
+    if shown >= 92:
+        return "High"
+    if shown >= 90:
+        return "Medium"
+    return "Watchlist"
+
+
+def market_availability_risk(alert_type, batters_away, market):
+    batters_away = safe_int(batters_away)
+    if alert_type in ["PRESSURE", "LIVE_BET"]:
+        return "Low"
+    if batters_away >= PREFERRED_MARKET_DISTANCE and market in ["Player H+R+RBI", "Player Total Bases", "Player Hits"]:
+        return "Low"
+    if batters_away >= 2:
+        return "Medium"
+    return "High"
+
+
+def tier_can_send(tier):
+    return tier == "GOLD" or (tier == "SILVER" and SEND_SILVER_ALERTS)
+
+
+def global_throttle_allows(game_pk, team, player_id, score, now=None):
+    global last_global_alert_time
+
+    now = now or time.time()
+    game_key = str(game_pk)
+    team_key = f"{game_pk}:{team}"
+    player_key = f"{game_pk}:{player_id}"
+
+    if last_global_alert_time and now - last_global_alert_time < GLOBAL_ALERT_COOLDOWN_SECONDS:
+        return False, "global cooldown"
+
+    if game_alerts.get(game_key, 0) >= MAX_ALERTS_PER_GAME:
+        return False, "game alert cap"
+    if team_game_alerts.get(team_key, 0) >= MAX_ALERTS_PER_TEAM_PER_GAME:
+        return False, "team game alert cap"
+
+    player_info = player_game_alerts.get(player_key)
+    if player_info:
+        if player_info["count"] >= MAX_ALERTS_PER_PLAYER_PER_GAME:
+            if score < player_info["best_score"] + PLAYER_SCORE_IMPROVEMENT:
+                return False, "player game alert cap"
+        elif score < player_info["best_score"] + PLAYER_SCORE_IMPROVEMENT:
+            return False, "player score did not improve enough"
+
+    return True, ""
+
+
+def record_global_alert(game_pk, team, player_id, score, now=None):
+    global last_global_alert_time
+
+    now = now or time.time()
+    game_key = str(game_pk)
+    team_key = f"{game_pk}:{team}"
+    player_key = f"{game_pk}:{player_id}"
+
+    last_global_alert_time = now
+    game_alerts[game_key] = game_alerts.get(game_key, 0) + 1
+    team_game_alerts[team_key] = team_game_alerts.get(team_key, 0) + 1
+    player_info = player_game_alerts.setdefault(player_key, {"count": 0, "best_score": 0})
+    player_info["count"] += 1
+    player_info["best_score"] = max(player_info["best_score"], score)
+
+
 def build_market_lines(markets, team_name=None):
     lines = []
 
@@ -1133,6 +1439,15 @@ def build_market_lines(markets, team_name=None):
         )
 
     return "\n\n".join(lines)
+
+
+def build_short_market_line(prefix, market, team_name=None):
+    market_name, score, label = market
+    return (
+        f"{prefix}: {label}\n"
+        f"Market Confidence: {market_confidence(score)} ({display_score(score)}/100)\n"
+        f"Find it: {market_path(market_name, team_name=team_name)}"
+    )
 
 
 def should_send_alert(key, score):
@@ -1174,6 +1489,55 @@ def format_score_debug(player_score, pitcher, pressure_score):
     )
 
 
+def build_candidate_record(
+    game_pk,
+    alert_type,
+    team,
+    player_score,
+    market,
+    score,
+    tier,
+    sent,
+    skip_reason,
+    inning,
+    outs,
+    base_text,
+    pitcher_obj,
+    pitcher,
+):
+    profile = player_score.get("profile", {})
+    target = player_score.get("target", {})
+    market_name = market[0] if market else ""
+    return {
+        "timestamp": utc_now().isoformat(),
+        "game_pk": game_pk,
+        "alert_type": alert_type,
+        "player": target.get("name", ""),
+        "player_id": target.get("id", ""),
+        "team": team,
+        "market": market_name,
+        "score": display_score(score),
+        "tier": tier,
+        "sent": bool(sent),
+        "skip_reason": skip_reason,
+        "inning": inning,
+        "outs": outs,
+        "bases": base_text,
+        "batters_away": target.get("batters_away", ""),
+        "pitcher": pitcher_obj.get("name", ""),
+        "pitcher_id": pitcher_obj.get("id", ""),
+        "pitcher_era": pitcher.get("era"),
+        "pitcher_whip": pitcher.get("whip"),
+        "pitcher_ip": pitcher.get("ip"),
+        "player_avg": profile.get("avg"),
+        "player_obp": profile.get("obp"),
+        "player_slg": profile.get("slg"),
+        "player_ops": profile.get("ops"),
+        "player_pa": profile.get("pa"),
+        "result": "pending",
+    }
+
+
 def build_get_ready_alert(
     team,
     target_score,
@@ -1190,27 +1554,34 @@ def build_get_ready_alert(
         min_score=MIN_PLAYER_MARKET_SCORE,
         runners_on=runners_on,
     )
+    best_market = markets[0]
+    backup_market = markets[1] if len(markets) > 1 and display_score(markets[1][1]) >= MIN_MARKET_DISPLAY_SCORE else None
+    tier = target_score.get("tier", "GOLD")
+    risk = market_availability_risk("GET_READY", target["batters_away"], best_market[0])
+    debug = f"\n\n{format_score_debug(target_score, pitcher, pressure_score)}" if SHOW_DEBUG else ""
 
-    return (
+    message = (
         "GET READY ALERT\n\n"
+        f"Alert Tier: {tier}\n"
+        f"Market Availability Risk: {risk}\n\n"
         "Target Player:\n"
         f"{target['name']} ({target['role']})\n\n"
-        "Markets To Check Now:\n"
-        f"{build_market_lines(markets, team_name=team)}\n\n"
-        "Team Fallback:\n"
-        f"{team} Team Total Over\n"
-        f"Find it: {market_path('Team Total Over', team_name=team)}\n"
-        f"Pressure Score: {display_score(pressure_score)}/100 {grade(pressure_score)}\n\n"
+        f"{build_short_market_line('Best Market', best_market, team_name=team)}\n"
+    )
+    if backup_market:
+        message += f"\n\n{build_short_market_line('Backup Market', backup_market, team_name=team)}\n"
+
+    return message + (
+        "\nWhy this is gold:\n"
+        f"- Pressure score {display_score(pressure_score)}/100 with {base_text.lower()}\n"
+        f"- Target is {target['batters_away']} batters away, giving more market-open time\n"
+        f"- This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
+        f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached\n\n"
         "Game Spot:\n"
         f"{team} batting\n"
         f"{game_spot}\n"
-        f"{base_text}\n\n"
-        "Why:\n"
-        f"- Target is {target['batters_away']} batters away, so props are more likely open\n"
-        "- Pressure is building before the market fully locks\n"
-        f"- This inning: {inning_pressure['hits']} hit(s), {inning_pressure['walks']} walk(s), "
-        f"{inning_pressure['runs']} run(s), {inning_pressure['consecutive_reached']} straight reached\n"
-        f"- {format_score_debug(target_score, pitcher, pressure_score)}"
+        f"{base_text}"
+        f"{debug}"
     )
 
 
@@ -1229,22 +1600,40 @@ def build_matchup_alert(
         min_score=MIN_MATCHUP_MARKET_SCORE,
         runners_on=runners_on,
     )
-
-    return (
-        "MATCHUP ALERT\n\n"
-        "Target Player:\n"
-        f"{target['name']} ({target['role']})\n\n"
-        "Markets To Check:\n"
-        f"{build_market_lines(markets, team_name=team)}\n\n"
-        "Game Spot:\n"
-        f"{team} batting\n"
-        f"{game_spot}\n"
-        f"{base_text}\n\n"
-        "Pitcher Weakness:\n"
-        f"{pitcher['weakness']} model points\n"
+    best_market = markets[0]
+    backup_market = markets[1] if len(markets) > 1 and display_score(markets[1][1]) >= MIN_MARKET_DISPLAY_SCORE else None
+    tier = target_score.get("tier", "GOLD")
+    risk = market_availability_risk("MATCHUP", target["batters_away"], best_market[0])
+    debug = (
+        f"\n\nPitcher Weakness: {pitcher['weakness']} model points\n"
         f"ERA/WHIP: {pitcher['era']:.2f}/{pitcher['whip']:.2f}\n"
         f"HR/9: {pitcher['hr9']:.2f} | BB/9: {pitcher['bb9']:.2f}\n"
         f"{format_score_debug(target_score, pitcher, pressure_score)}"
+        if SHOW_DEBUG
+        else ""
+    )
+
+    message = (
+        "MATCHUP ALERT\n\n"
+        f"Alert Tier: {tier}\n"
+        f"Market Availability Risk: {risk}\n\n"
+        "Target Player:\n"
+        f"{target['name']} ({target['role']})\n\n"
+        f"{build_short_market_line('Best Market', best_market, team_name=team)}\n"
+    )
+    if backup_market:
+        message += f"\n\n{build_short_market_line('Backup Market', backup_market, team_name=team)}\n"
+
+    return message + (
+        "\nWhy this is gold:\n"
+        "- Player passed quality gates\n"
+        "- Best market cleared elite matchup threshold\n"
+        "- Pitcher or player profile supports the edge\n\n"
+        "Game Spot:\n"
+        f"{team} batting\n"
+        f"{game_spot}\n"
+        f"{base_text}"
+        f"{debug}"
     )
 
 
@@ -1259,6 +1648,9 @@ def build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pres
 
     return (
         "PRESSURE BUILDING\n\n"
+        f"Alert Tier: GOLD\n"
+        f"Market Confidence: {market_confidence(pressure_score)} ({display_score(pressure_score)}/100)\n"
+        "Market Availability Risk: Low\n\n"
         "Target Team:\n"
         f"{team}\n\n"
         "Markets To Check:\n"
@@ -1340,6 +1732,9 @@ def check_game(game_pk):
             target=target,
             pitcher=pitcher,
             pressure_score=pressure_score,
+            offense=offense,
+            inning=inning,
+            inning_pressure=inning_pressure,
         )
         player_score["qualified_score"] = best_qualified_market_score(
             player_score,
@@ -1362,45 +1757,136 @@ def check_game(game_pk):
         target
         for target in scored_targets
         if safe_int(target["target"]["batters_away"]) >= MIN_TARGET_BATTERS_AWAY
-        and target["qualified_score"] > 0
+        and safe_int(target["target"]["batters_away"]) <= MAX_TARGET_BATTERS_AWAY
     ]
 
     if not early_targets:
         print(f"{team}: no early targets available", flush=True)
         return
 
-    early_targets.sort(key=lambda x: x["qualified_score"], reverse=True)
+    early_targets.sort(key=lambda x: (x["qualified_score"], x["best_score"]), reverse=True)
     best_target = early_targets[0]
 
     game_spot = f"{half_display} {inning_display} | {outs} outs | Count {balls}-{strikes}"
     base_text = runners_summary(offense)
 
+    for lower_target in early_targets[1:]:
+        lower_markets = top_player_markets(
+            lower_target,
+            min_score=MIN_PLAYER_MARKET_SCORE,
+            runners_on=runners_on,
+        )
+        lower_market = lower_markets[0] if lower_markets else None
+        lower_score = lower_market[1] if lower_market else lower_target["best_score"]
+        record_candidate(build_candidate_record(
+            game_pk,
+            "CANDIDATE",
+            team,
+            lower_target,
+            lower_market,
+            lower_score,
+            alert_tier(lower_score, pressure_score, "MATCHUP"),
+            False,
+            "lower ranked candidate",
+            inning,
+            outs,
+            base_text,
+            pitcher_obj,
+            pitcher,
+        ))
+
     msg = None
     alert_type = None
     alert_score = 0
+    alert_market = None
+    alert_tier_value = "WATCHLIST"
 
     skip_reason = None
 
-    if pressure_score < MIN_ALERT_PRESSURE_SCORE:
-        skip_reason = f"pressure below {MIN_ALERT_PRESSURE_SCORE}"
-    elif is_low_quality_timing(outs, strikes):
+    if is_low_quality_timing(outs, strikes):
         skip_reason = "two strikes with two outs"
-    elif not pitcher_context_allows_alert(pitcher, pressure_score, bases_loaded):
-        skip_reason = "pitcher is not weak enough without bases-loaded pressure"
 
-    if skip_reason:
-        print(
-            f"{team} {game_spot} | Pitcher {pitcher_obj['name']} | "
-            f"Pressure {pressure_score} | Best qualified target "
-            f"{best_target['target']['name']} {best_target['target']['role']} "
-            f"{best_target['qualified_score']} | skipped: {skip_reason}",
-            flush=True,
+    for target_score in early_targets:
+        markets = top_player_markets(
+            target_score,
+            min_score=MIN_PLAYER_MARKET_SCORE,
+            runners_on=runners_on,
         )
-        return
+        candidate_market = markets[0] if markets else None
+        candidate_score = candidate_market[1] if candidate_market else target_score["best_score"]
+        candidate_tier = alert_tier(candidate_score, pressure_score, "MATCHUP")
+        reason = skip_reason
 
-    if best_target["qualified_score"] >= MIN_GET_READY_SCORE and pressure_score >= 65:
+        if not reason and not markets:
+            reason = "no market cleared display threshold"
+        if not reason and pressure_score < MIN_ALERT_PRESSURE_SCORE:
+            reason = f"pressure below {MIN_ALERT_PRESSURE_SCORE}"
+        if not reason and not pitcher_context_allows_alert(pitcher, pressure_score, bases_loaded):
+            reason = "pitcher is not weak enough without bases-loaded pressure"
+
+        if reason:
+            record_candidate(build_candidate_record(
+                game_pk,
+                "MATCHUP",
+                team,
+                target_score,
+                candidate_market,
+                candidate_score,
+                candidate_tier,
+                False,
+                reason,
+                inning,
+                outs,
+                base_text,
+                pitcher_obj,
+                pitcher,
+            ))
+
+    player_markets = top_player_markets(
+        best_target,
+        min_score=MIN_PLAYER_MARKET_SCORE,
+        runners_on=runners_on,
+    )
+    matchup_markets = top_player_markets(
+        best_target,
+        min_score=MIN_MATCHUP_MARKET_SCORE,
+        runners_on=runners_on,
+    )
+    player_context_ok = (
+        pressure_score >= MIN_ALERT_PRESSURE_SCORE
+        and pitcher_context_allows_alert(pitcher, pressure_score, bases_loaded)
+    )
+
+    if not skip_reason and pressure_score >= 94 and player_context_ok and player_markets:
+        alert_type = "LIVE_BET"
+        alert_market = player_markets[0]
+        alert_score = max(pressure_score, alert_market[1])
+        alert_tier_value = "GOLD"
+        best_target["tier"] = alert_tier_value
+        msg = build_get_ready_alert(
+            team,
+            best_target,
+            pressure_score,
+            game_spot,
+            base_text,
+            inning_pressure,
+            pitcher,
+            runners_on=runners_on,
+        ).replace("GET READY ALERT", "LIVE BET ALERT", 1)
+
+    elif (
+        not skip_reason
+        and player_context_ok
+        and best_target["qualified_score"] >= MIN_GET_READY_SCORE
+        and pressure_score >= 75
+        and (runners_on or inning_pressure["consecutive_reached"] >= 2)
+        and player_markets
+    ):
         alert_type = "GET_READY"
-        alert_score = best_target["qualified_score"]
+        alert_market = player_markets[0]
+        alert_score = alert_market[1]
+        alert_tier_value = alert_tier(alert_score, pressure_score, alert_type)
+        best_target["tier"] = alert_tier_value
         msg = build_get_ready_alert(
             team,
             best_target,
@@ -1412,9 +1898,19 @@ def check_game(game_pk):
             runners_on=runners_on,
         )
 
-    elif best_target["matchup_qualified_score"] >= MIN_MATCHUP_SCORE:
+    elif (
+        not skip_reason
+        and player_context_ok
+        and best_target["matchup_qualified_score"] >= MIN_MATCHUP_SCORE
+        and best_target["quality_gate"]
+        and (pitcher["weakness"] >= 5 or best_target["elite_profile"])
+        and matchup_markets
+    ):
         alert_type = "MATCHUP"
-        alert_score = best_target["matchup_qualified_score"]
+        alert_market = matchup_markets[0]
+        alert_score = alert_market[1]
+        alert_tier_value = alert_tier(alert_score, pressure_score, alert_type)
+        best_target["tier"] = alert_tier_value
         msg = build_matchup_alert(
             team,
             best_target,
@@ -1425,24 +1921,105 @@ def check_game(game_pk):
             runners_on=runners_on,
         )
 
-    elif pressure_score >= MIN_PRESSURE_SCORE:
+    elif not skip_reason and pressure_score >= MIN_PRESSURE_SCORE:
         alert_type = "PRESSURE"
         alert_score = pressure_score
+        alert_market = ("Team Total Over", pressure_score, f"{team} Team Total Over")
+        alert_tier_value = alert_tier(alert_score, pressure_score, alert_type)
         msg = build_pressure_alert(team, pressure_score, game_spot, base_text, inning_pressure, early_targets)
 
     if not msg:
+        reason = skip_reason or "alert rules not strong enough"
+        record_candidate(build_candidate_record(
+            game_pk,
+            "CANDIDATE",
+            team,
+            best_target,
+            alert_market,
+            best_target.get("qualified_score", 0),
+            alert_tier_value,
+            False,
+            reason,
+            inning,
+            outs,
+            base_text,
+            pitcher_obj,
+            pitcher,
+        ))
         print(
             f"{team} {game_spot} | Pitcher {pitcher_obj['name']} | "
             f"Pressure {pressure_score} | Best early target "
             f"{best_target['target']['name']} {best_target['target']['role']} "
-            f"{best_target['qualified_score']} | {format_score_debug(best_target, pitcher, pressure_score)} | no alert",
+            f"{best_target['qualified_score']} | skipped: {reason}",
             flush=True,
         )
         return
 
+    if not tier_can_send(alert_tier_value):
+        record_candidate(build_candidate_record(
+            game_pk,
+            alert_type,
+            team,
+            best_target,
+            alert_market,
+            alert_score,
+            alert_tier_value,
+            False,
+            f"{alert_tier_value.lower()} alerts disabled",
+            inning,
+            outs,
+            base_text,
+            pitcher_obj,
+            pitcher,
+        ))
+        print(f"Skipping {alert_type}: {alert_tier_value} alerts disabled", flush=True)
+        return
+
     spot_key = f"{game_pk}-{inning}-{half}-{team}-{alert_type}-{best_target['target']['id']}"
 
+    allowed, throttle_reason = global_throttle_allows(
+        game_pk,
+        team,
+        best_target["target"]["id"],
+        alert_score,
+    )
+    if not allowed:
+        record_candidate(build_candidate_record(
+            game_pk,
+            alert_type,
+            team,
+            best_target,
+            alert_market,
+            alert_score,
+            alert_tier_value,
+            False,
+            throttle_reason,
+            inning,
+            outs,
+            base_text,
+            pitcher_obj,
+            pitcher,
+        ))
+        print(f"Skipping {alert_type}: {throttle_reason}", flush=True)
+        return
+
     if not should_send_alert(spot_key, alert_score):
+        record_candidate(build_candidate_record(
+            game_pk,
+            alert_type,
+            team,
+            best_target,
+            alert_market,
+            alert_score,
+            alert_tier_value,
+            False,
+            "half-inning cooldown",
+            inning,
+            outs,
+            base_text,
+            pitcher_obj,
+            pitcher,
+        ))
         print(f"Skipping duplicate/cooldown: {spot_key}", flush=True)
         return
 
@@ -1463,23 +2040,40 @@ def check_game(game_pk):
         "target_role": best_target["target"]["role"],
         "target_id": best_target["target"]["id"],
         "score": display_score(alert_score),
+        "tier": alert_tier_value,
+        "sent": True,
+        "best_market": alert_market[0] if alert_market else "",
+        "market_confidence": market_confidence(alert_score),
+        "market_availability_risk": market_availability_risk(
+            alert_type,
+            best_target["target"]["batters_away"],
+            alert_market[0] if alert_market else "",
+        ),
         "pressure_score": display_score(pressure_score),
         "game_spot": game_spot,
         "base_state": base_text,
         "markets": [
-            label
-            for _, _, label in top_player_markets(
-                best_target,
-                min_score=(
-                    MIN_MATCHUP_MARKET_SCORE
-                    if alert_type == "MATCHUP"
-                    else MIN_PLAYER_MARKET_SCORE
-                ),
-                runners_on=runners_on,
-            )
+            alert_market[2] if alert_market else ""
         ],
         "status": "open",
     })
+    record_candidate(build_candidate_record(
+        game_pk,
+        alert_type,
+        team,
+        best_target,
+        alert_market,
+        alert_score,
+        alert_tier_value,
+        True,
+        "",
+        inning,
+        outs,
+        base_text,
+        pitcher_obj,
+        pitcher,
+    ))
+    record_global_alert(game_pk, team, best_target["target"]["id"], alert_score)
     msg = f"{msg}{tracking_footer(alert_id)}"
 
     print(
