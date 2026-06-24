@@ -98,6 +98,14 @@ OUTCOME_COMMANDS = {
     "/didnt_bet": "didnt_bet",
 }
 
+CALLBACK_ACTIONS = {
+    "win": "win",
+    "loss": "loss",
+    "push": "push",
+    "nomarket": "no_market",
+    "didntbet": "didnt_bet",
+}
+
 SETTLE_CHOICES = {
     "1": "win",
     "win": "win",
@@ -897,17 +905,49 @@ def build_alert_details(alert_id):
 def tracking_footer(alert_id):
     return (
         f"\nID: {alert_id}\n"
-        f"Report: /win {alert_id} | /loss {alert_id} | /push {alert_id} | /nomarket {alert_id}\n"
-        f"Details: /details {alert_id}"
+        "Tap a button below to report or view details."
     )
 
 
-def send_telegram(chat_id, msg):
+def alert_reply_markup(alert_id):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Win", "callback_data": f"result|win|{alert_id}"},
+                {"text": "Loss", "callback_data": f"result|loss|{alert_id}"},
+            ],
+            [
+                {"text": "Push", "callback_data": f"result|push|{alert_id}"},
+                {"text": "No Market", "callback_data": f"result|nomarket|{alert_id}"},
+            ],
+            [
+                {"text": "Details", "callback_data": f"details|{alert_id}"},
+            ],
+        ]
+    }
+
+
+def send_telegram(chat_id, msg, reply_markup=None):
     url = f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendMessage"
-    data = request_json("post", url, data={"chat_id": chat_id, "text": msg})
+    payload = {"chat_id": chat_id, "text": msg}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    data = request_json("post", url, data=payload)
     if data.get("ok") is not True:
         raise RuntimeError(f"Telegram send failed: {data}")
     return data
+
+
+def answer_callback_query(callback_query_id, text=None):
+    url = f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        return request_json("post", url, data=payload)
+    except Exception as exc:
+        print("Telegram callback answer error:", exc, flush=True)
+        return None
 
 
 def get_sheet_subscribers():
@@ -935,12 +975,12 @@ def save_subscriber(chat_id, username="", first_name="", status="active"):
         return False
 
 
-def broadcast(msg):
+def broadcast(msg, reply_markup=None):
     subscribers = get_sheet_subscribers()
     print(f"Broadcasting to {len(subscribers)} subscriber(s)", flush=True)
     for chat_id in subscribers:
         try:
-            send_telegram(chat_id, msg)
+            send_telegram(chat_id, msg, reply_markup=reply_markup)
         except Exception as exc:
             print(f"Send error to {chat_id}:", exc, flush=True)
 
@@ -957,8 +997,7 @@ def subscription_message():
         "/markets - show market availability\n"
         "/pending - show open tracked alerts\n"
         "/details ID - show alert breakdown\n"
-        "/settle ID - quick report an alert result\n"
-        "/win ID, /loss ID, /push ID, /nomarket ID - report an alert result\n"
+        "Use the buttons under each alert to report results.\n"
         "/stop - stop alerts\n"
         "/join - restart alerts"
     )
@@ -986,6 +1025,51 @@ def outcome_response(alert, outcome):
     )
 
 
+def handle_callback_query(update):
+    callback = update.get("callback_query")
+    if not callback:
+        return False
+
+    callback_id = callback.get("id")
+    message = callback.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    user_id = callback.get("from", {}).get("id", chat_id)
+    data = callback.get("data", "")
+
+    if not chat_id or not data:
+        if callback_id:
+            answer_callback_query(callback_id, "Could not read that button.")
+        return True
+
+    parts = data.split("|", 2)
+
+    if len(parts) == 2 and parts[0] == "details":
+        alert_id = parts[1]
+        answer_callback_query(callback_id, "Opening details.")
+        send_telegram(chat_id, build_alert_details(alert_id))
+        return True
+
+    if len(parts) == 3 and parts[0] == "result":
+        action = parts[1]
+        alert_id = parts[2]
+        outcome = CALLBACK_ACTIONS.get(action)
+        if not outcome:
+            answer_callback_query(callback_id, "Unknown report button.")
+            return True
+
+        alert = record_alert_outcome(alert_id, outcome, user_id)
+        if alert:
+            answer_callback_query(callback_id, "Result recorded.")
+            send_telegram(chat_id, outcome_response(alert, outcome))
+        else:
+            answer_callback_query(callback_id, "Alert not found.")
+            send_telegram(chat_id, f"I couldn't find alert ID {alert_id}.\n\n{build_pending_alerts()}")
+        return True
+
+    answer_callback_query(callback_id, "Unknown button.")
+    return True
+
+
 def check_telegram_messages():
     global last_update_id
 
@@ -1004,6 +1088,9 @@ def check_telegram_messages():
     for update in data.get("result", []):
         last_update_id = update.get("update_id", last_update_id)
         save_last_update_id(last_update_id)
+
+        if handle_callback_query(update):
+            continue
 
         message = update.get("message", {})
         chat = message.get("chat", {})
@@ -2569,7 +2656,7 @@ def check_game(game_pk):
         flush=True,
     )
 
-    broadcast(msg)
+    broadcast(msg, reply_markup=alert_reply_markup(alert_id))
 
 
 def main():

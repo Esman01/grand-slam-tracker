@@ -332,6 +332,61 @@ class ResultTrackingTests(unittest.TestCase):
                 self.assertEqual(alert["odds"], 180)
                 self.assertAlmostEqual(alert["profit_units"], 1.8)
 
+    def test_tracking_footer_uses_buttons_instead_of_command_spam(self):
+        footer = main.tracking_footer("alert-1")
+
+        self.assertIn("ID: alert-1", footer)
+        self.assertIn("Tap a button", footer)
+        self.assertNotIn("/win alert-1", footer)
+        self.assertNotIn("/details alert-1", footer)
+
+    def test_alert_reply_markup_carries_alert_id(self):
+        markup = main.alert_reply_markup("alert-1")
+
+        buttons = [
+            button
+            for row in markup["inline_keyboard"]
+            for button in row
+        ]
+        callback_data = [button["callback_data"] for button in buttons]
+
+        self.assertIn("result|win|alert-1", callback_data)
+        self.assertIn("result|nomarket|alert-1", callback_data)
+        self.assertIn("details|alert-1", callback_data)
+
+    def test_callback_result_records_without_typed_alert_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                with patch.object(main, "post_sheet_event", return_value=True):
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "GET_READY",
+                        "target": "Test Player",
+                        "best_market": "Player Hits",
+                        "status": "open",
+                    })
+
+                    update = {
+                        "callback_query": {
+                            "id": "callback-1",
+                            "data": "result|nomarket|alert-1",
+                            "from": {"id": 123},
+                            "message": {"chat": {"id": 456}},
+                        }
+                    }
+                    with patch.object(main, "answer_callback_query") as answer:
+                        with patch.object(main, "send_telegram") as send:
+                            handled = main.handle_callback_query(update)
+
+                self.assertTrue(handled)
+                answer.assert_called()
+                send.assert_called()
+                alert = main.find_alert("alert-1")
+                self.assertEqual(alert["status"], "no_market")
+                self.assertEqual(alert["reported_by"], "123")
+
     def test_market_penalty_reduces_low_availability_market(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             result_file = os.path.join(temp_dir, "results.json")

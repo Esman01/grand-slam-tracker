@@ -91,7 +91,7 @@ Optional:
 - `/push ID`: Mark an alert as a push/void.
 - `/nomarket ID`: Mark an alert as unavailable or locked.
 
-Each alert includes its own tracking ID and example report commands.
+Each alert includes its own tracking ID plus inline buttons for `Win`, `Loss`, `Push`, `No Market`, and `Details`. The buttons carry the alert ID automatically so users do not need to type or remember it. Text commands remain available as a fallback.
 
 ## Sheet telemetry
 
@@ -103,7 +103,7 @@ Player alerts only list markets that clear the configured market threshold, so w
 
 Alerts are tiered as `GOLD`, `SILVER`, or `WATCHLIST`. Telegram sends `GOLD` by default, sends `SILVER` only when enabled, and logs `WATCHLIST` candidates without sending them. Market ranking favors Hits+Runs+RBIs, Total Bases, and Hits before RBI or Home Run. Home Run markets only appear when the score is elite and the player has a real power profile.
 
-Telegram alert copy is intentionally short: player/team, best bet, backup bet when strong enough, find path, game spot, why it passed, why the alert is early, and tracking ID. Raw stats and model breakdowns are hidden behind `/details ID`.
+Telegram alert copy is intentionally short: player/team, best bet, backup bet when strong enough, find path, game spot, why it passed, why the alert is early, and tracking ID. Raw stats and model breakdowns are hidden behind the `Details` button or `/details ID`.
 
 Result commands accept optional American odds, such as `/win ID +180` or `/loss ID -110`. `/settle ID` also accepts odds in the reply, such as `1 +180`.
 
