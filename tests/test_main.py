@@ -186,6 +186,20 @@ class AlertQualityFilterTests(unittest.TestCase):
         self.assertTrue(main.tier_can_send("GOLD"))
         self.assertFalse(main.tier_can_send("WATCHLIST"))
 
+    def test_early_explanation_names_current_on_deck_and_target(self):
+        text = main.build_early_explanation(
+            {"fullName": "Jose Altuve"},
+            [
+                {"name": "Christian Walker", "batters_away": 1},
+                {"name": "Cam Smith", "batters_away": 2},
+            ],
+            {"name": "Cam Smith", "batters_away": 2},
+        )
+
+        self.assertIn("WHY THIS ALERT IS EARLY", text)
+        self.assertIn("Current batter: Jose Altuve", text)
+        self.assertIn("On deck: Christian Walker", text)
+
 
 class ResultTrackingTests(unittest.TestCase):
     def test_make_alert_id_is_stable_for_alert_context(self):
@@ -243,6 +257,69 @@ class ResultTrackingTests(unittest.TestCase):
                 self.assertIn("MATCHUP: 0.0% win", recap)
                 self.assertIn("Player Hits", recap)
                 self.assertIn("pressure below 60: 1", recap)
+
+    def test_market_report_tracks_availability(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                with patch.object(main, "post_sheet_event", return_value=True):
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "MATCHUP",
+                        "target": "Test Player",
+                        "best_market": "Player RBI",
+                        "score": 91,
+                        "sent": True,
+                        "status": "open",
+                    })
+                    main.record_alert_outcome("alert-1", "no_market", "123")
+
+                report = main.build_market_report(days=1)
+
+                self.assertIn("Player RBI", report)
+                self.assertIn("Availability Rate: 0.0%", report)
+
+    def test_settlement_reply_records_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                with patch.object(main, "post_sheet_event", return_value=True):
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "GET_READY",
+                        "target": "Test Player",
+                        "best_market": "Player Hits",
+                        "status": "open",
+                    })
+
+                    main.pending_settlements["123"] = "alert-1"
+                    response = main.handle_settlement_reply("123", "4")
+
+                self.assertIn("Recorded no market/locked", response)
+                self.assertNotIn("123", main.pending_settlements)
+
+    def test_market_penalty_reduces_low_availability_market(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                with patch.object(main, "post_sheet_event", return_value=True):
+                    for idx in range(main.MARKET_AVAILABILITY_MIN_SAMPLE):
+                        alert_id = f"alert-{idx}"
+                        main.record_alert({
+                            "id": alert_id,
+                            "sent_at": main.utc_now().isoformat(),
+                            "alert_type": "MATCHUP",
+                            "target": "Test Player",
+                            "best_market": "Player RBI",
+                            "score": 91,
+                            "sent": True,
+                            "status": "open",
+                        })
+                        main.record_alert_outcome(alert_id, "no_market", "123")
+
+                self.assertGreater(main.market_performance_penalty("Player RBI"), 0)
 
     def test_record_alert_posts_sheet_telemetry(self):
         with tempfile.TemporaryDirectory() as temp_dir:

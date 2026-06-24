@@ -47,6 +47,13 @@ Optional:
 - `MAX_MARKETS_PER_ALERT`: Maximum player markets listed in one alert. Default: `2`.
 - `SECONDARY_MARKET_MAX_DROP`: Maximum score drop from the top market for secondary markets. Default: `4`.
 - `MIN_MARKET_DISPLAY_SCORE`: Minimum market score shown in Telegram. Default: `88`.
+- `AUTO_MARKET_PENALTIES`: Penalize markets with poor availability or poor graded results. Default: `true`.
+- `MARKET_AVAILABILITY_MIN_SAMPLE`: Minimum sample before market penalties apply. Default: `10`.
+- `LOW_MARKET_AVAILABILITY_RATE`: Availability rate that triggers market penalties. Default: `.35`.
+- `MARKET_PENALTY_POINTS`: Score penalty for poor markets. Default: `8`.
+- `SCORE_CALIBRATION_MIN_SAMPLE`: Minimum high-score graded sample before score calibration applies. Default: `10`.
+- `SCORE_CALIBRATION_MIN_WIN_RATE`: Minimum win rate expected from high-score alerts. Default: `.50`.
+- `SCORE_CALIBRATION_PENALTY`: Score penalty when high-score alerts underperform. Default: `5`.
 - `MIN_PLAYER_OPS`: Minimum OPS for matchup alerts. Default: `.750`.
 - `MIN_PLAYER_SLG`: Minimum SLG for matchup alerts. Default: `.400`.
 - `MIN_PLAYER_PA`: Minimum plate appearances for matchup alerts. Default: `80`.
@@ -71,7 +78,9 @@ Optional:
 - `/status`: Check subscription status.
 - `/pending`: Show open tracked alerts.
 - `/recap`: Show recent performance.
+- `/markets`: Show market availability and no-market counts.
 - `/details ID`: Show the hidden debug breakdown for one alert.
+- `/settle ID`: Start a quick result prompt.
 - `/win ID`: Mark an alert as a win.
 - `/loss ID`: Mark an alert as a loss.
 - `/push ID`: Mark an alert as a push/void.
@@ -89,9 +98,9 @@ Player alerts only list markets that clear the configured market threshold, so w
 
 Alerts are tiered as `GOLD`, `SILVER`, or `WATCHLIST`. Telegram sends `GOLD` by default, sends `SILVER` only when enabled, and logs `WATCHLIST` candidates without sending them. Market ranking favors Hits+Runs+RBIs, Total Bases, and Hits before RBI or Home Run. Home Run markets only appear when the score is elite and the player has a real power profile.
 
-Telegram alert copy is intentionally short: player/team, best bet, backup bet when strong enough, find path, game spot, why it passed, and tracking ID. Raw stats and model breakdowns are hidden behind `/details ID`.
+Telegram alert copy is intentionally short: player/team, best bet, backup bet when strong enough, find path, game spot, why it passed, why the alert is early, and tracking ID. Raw stats and model breakdowns are hidden behind `/details ID`.
 
-`/recap` includes sent alerts, record, win rate by alert type, win rate and no-market rate by market, top skipped reasons, and average score of winners versus losers. `/pending` only shows ungraded sent alerts.
+`/recap` includes sent alerts, record, win rate by alert type, market availability rate, top skipped reasons, and average score of winners versus losers. `/markets` focuses only on market availability. `/pending` only shows ungraded sent alerts.
 
 ## Local setup
 

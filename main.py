@@ -39,6 +39,13 @@ STRONG_PITCHER_PRESSURE_SCORE = int(os.getenv("STRONG_PITCHER_PRESSURE_SCORE", "
 MAX_MARKETS_PER_ALERT = int(os.getenv("MAX_MARKETS_PER_ALERT", "2"))
 SECONDARY_MARKET_MAX_DROP = int(os.getenv("SECONDARY_MARKET_MAX_DROP", "4"))
 MIN_MARKET_DISPLAY_SCORE = int(os.getenv("MIN_MARKET_DISPLAY_SCORE", "88"))
+AUTO_MARKET_PENALTIES = os.getenv("AUTO_MARKET_PENALTIES", "true").lower() == "true"
+MARKET_AVAILABILITY_MIN_SAMPLE = int(os.getenv("MARKET_AVAILABILITY_MIN_SAMPLE", "10"))
+LOW_MARKET_AVAILABILITY_RATE = float(os.getenv("LOW_MARKET_AVAILABILITY_RATE", ".35"))
+MARKET_PENALTY_POINTS = int(os.getenv("MARKET_PENALTY_POINTS", "8"))
+SCORE_CALIBRATION_MIN_SAMPLE = int(os.getenv("SCORE_CALIBRATION_MIN_SAMPLE", "10"))
+SCORE_CALIBRATION_MIN_WIN_RATE = float(os.getenv("SCORE_CALIBRATION_MIN_WIN_RATE", ".50"))
+SCORE_CALIBRATION_PENALTY = int(os.getenv("SCORE_CALIBRATION_PENALTY", "5"))
 MIN_PLAYER_OPS = float(os.getenv("MIN_PLAYER_OPS", ".750"))
 MIN_PLAYER_SLG = float(os.getenv("MIN_PLAYER_SLG", ".400"))
 MIN_PLAYER_PA = int(os.getenv("MIN_PLAYER_PA", "80"))
@@ -67,6 +74,7 @@ game_alerts = {}
 team_game_alerts = {}
 player_game_alerts = {}
 last_global_alert_time = 0
+pending_settlements = {}
 player_stats_cache = {}
 injury_cache = {}
 last_update_id = None
@@ -81,6 +89,25 @@ OUTCOME_COMMANDS = {
     "/nomarket": "no_market",
     "/no_market": "no_market",
     "/locked": "no_market",
+    "/didntbet": "didnt_bet",
+    "/didnt_bet": "didnt_bet",
+}
+
+SETTLE_CHOICES = {
+    "1": "win",
+    "win": "win",
+    "2": "loss",
+    "loss": "loss",
+    "3": "push",
+    "push": "push",
+    "void": "push",
+    "4": "no_market",
+    "nomarket": "no_market",
+    "no_market": "no_market",
+    "locked": "no_market",
+    "5": "didnt_bet",
+    "didntbet": "didnt_bet",
+    "didnt_bet": "didnt_bet",
 }
 
 
@@ -340,6 +367,44 @@ def record_alert_outcome(alert_id, outcome, reported_by):
     return None
 
 
+def settlement_prompt(alert_id):
+    alert = find_alert(alert_id)
+    if not alert:
+        return f"I couldn't find alert ID {alert_id}.\n\n{build_pending_alerts()}"
+
+    return (
+        f"Settle {alert_id}\n\n"
+        f"{alert.get('target', alert.get('team', 'Alert'))}\n"
+        f"{alert.get('best_market', 'Market')}\n\n"
+        "Did you bet it?\n\n"
+        "1. Win\n"
+        "2. Loss\n"
+        "3. Push\n"
+        "4. No Market\n"
+        "5. Didn't Bet\n\n"
+        "Reply with 1, 2, 3, 4, or 5."
+    )
+
+
+def handle_settlement_reply(chat_id, text):
+    alert_id = pending_settlements.get(str(chat_id))
+    if not alert_id:
+        return None
+
+    choice = SETTLE_CHOICES.get((text or "").strip().lower())
+    if not choice:
+        return (
+            "Reply with 1, 2, 3, 4, or 5.\n\n"
+            "1. Win\n2. Loss\n3. Push\n4. No Market\n5. Didn't Bet"
+        )
+
+    pending_settlements.pop(str(chat_id), None)
+    alert = record_alert_outcome(alert_id, choice, chat_id)
+    if not alert:
+        return f"I couldn't find alert ID {alert_id}.\n\n{build_pending_alerts()}"
+    return outcome_response(alert, choice)
+
+
 def summarize_results(days=1, now=None):
     now = now or utc_now()
     cutoff = now - timedelta(days=days)
@@ -351,6 +416,7 @@ def summarize_results(days=1, now=None):
         "loss": 0,
         "push": 0,
         "no_market": 0,
+        "didnt_bet": 0,
         "by_type": {},
         "by_market": {},
         "skipped_reasons": {},
@@ -415,6 +481,113 @@ def summarize_results(days=1, now=None):
     return summary
 
 
+def build_market_stats(days=RESULTS_RECAP_DAYS, now=None):
+    now = now or utc_now()
+    cutoff = now - timedelta(days=days)
+    stats = {}
+
+    for alert in load_result_store().get("alerts", []):
+        if alert.get("sent", True) is not True:
+            continue
+        sent_at = parse_iso_datetime(alert.get("sent_at"))
+        if sent_at < cutoff:
+            continue
+
+        market = alert.get("best_market") or (
+            alert.get("markets", ["UNKNOWN"])[0] if alert.get("markets") else "UNKNOWN"
+        )
+        status = alert.get("status", "open")
+        item = stats.setdefault(
+            market,
+            {
+                "sent": 0,
+                "available": 0,
+                "win": 0,
+                "loss": 0,
+                "push": 0,
+                "no_market": 0,
+                "didnt_bet": 0,
+            },
+        )
+        item["sent"] += 1
+        if status != "no_market":
+            item["available"] += 1
+        if status in item:
+            item[status] += 1
+
+    return stats
+
+
+def build_market_report(days=RESULTS_RECAP_DAYS):
+    stats = build_market_stats(days)
+    if not stats:
+        return f"Market report: last {days} day(s)\n\nNo sent alerts yet."
+
+    lines = [f"Market report: last {days} day(s)"]
+    for market, item in sorted(stats.items(), key=lambda value: value[1]["sent"], reverse=True):
+        availability = (item["available"] / item["sent"] * 100) if item["sent"] else 0
+        graded = item["win"] + item["loss"]
+        win_rate = (item["win"] / graded * 100) if graded else 0
+        lines.extend([
+            "",
+            market,
+            f"Sent: {item['sent']}",
+            f"Available: {item['available']}",
+            f"Availability Rate: {availability:.1f}%",
+            f"Win Rate: {win_rate:.1f}%" if graded else "Win Rate: not enough graded alerts",
+            f"No Market: {item['no_market']}",
+        ])
+    return "\n".join(lines)
+
+
+def market_performance_penalty(market):
+    if not AUTO_MARKET_PENALTIES or not market:
+        return 0
+
+    stats = build_market_stats(days=30)
+    item = stats.get(market)
+    if not item or item["sent"] < MARKET_AVAILABILITY_MIN_SAMPLE:
+        return 0
+
+    availability = item["available"] / item["sent"] if item["sent"] else 1
+    if availability < LOW_MARKET_AVAILABILITY_RATE:
+        return MARKET_PENALTY_POINTS
+
+    graded = item["win"] + item["loss"]
+    if graded >= MARKET_AVAILABILITY_MIN_SAMPLE:
+        win_rate = item["win"] / graded
+        if win_rate < SCORE_CALIBRATION_MIN_WIN_RATE:
+            return max(3, MARKET_PENALTY_POINTS // 2)
+
+    return 0
+
+
+def score_calibration_penalty(score):
+    if safe_float(score) < 90:
+        return 0
+
+    high_score_alerts = []
+    for alert in load_result_store().get("alerts", []):
+        if safe_float(alert.get("score")) >= 90 and alert.get("status") in ["win", "loss"]:
+            high_score_alerts.append(alert)
+
+    if len(high_score_alerts) < SCORE_CALIBRATION_MIN_SAMPLE:
+        return 0
+
+    wins = sum(1 for alert in high_score_alerts if alert.get("status") == "win")
+    win_rate = wins / len(high_score_alerts)
+    if win_rate < SCORE_CALIBRATION_MIN_WIN_RATE:
+        return SCORE_CALIBRATION_PENALTY
+    return 0
+
+
+def calibrated_market_score(market, score):
+    adjusted = safe_float(score)
+    adjusted -= market_performance_penalty(market)
+    adjusted -= score_calibration_penalty(adjusted)
+    return max(0, adjusted)
+
+
 def build_results_recap(days=RESULTS_RECAP_DAYS):
     summary = summarize_results(days)
     graded = summary["win"] + summary["loss"]
@@ -426,6 +599,7 @@ def build_results_recap(days=RESULTS_RECAP_DAYS):
         f"Sent alerts: {summary['sent']}",
         f"Record: {summary['win']}-{summary['loss']}-{summary['push']}",
         f"No market/locked: {summary['no_market']}",
+        f"Didn't bet: {summary['didnt_bet']}",
         f"Still open: {summary['open']}",
         f"Win rate: {win_rate:.1f}%" if graded else "Win rate: not enough graded alerts",
     ]
@@ -447,12 +621,13 @@ def build_results_recap(days=RESULTS_RECAP_DAYS):
             market_graded = info["win"] + info["loss"]
             market_win_rate = (info["win"] / market_graded * 100) if market_graded else 0
             nomarket_rate = (info["no_market"] / info["total"] * 100) if info["total"] else 0
+            availability_rate = 100 - nomarket_rate
             if market_graded:
                 market_lines.append(
-                    f"{market}: {market_win_rate:.1f}% win | {nomarket_rate:.1f}% nomarket"
+                    f"{market}: {market_win_rate:.1f}% win | {availability_rate:.1f}% available"
                 )
             else:
-                market_lines.append(f"{market}: no graded bets | {nomarket_rate:.1f}% nomarket")
+                market_lines.append(f"{market}: no graded bets | {availability_rate:.1f}% available")
         lines.extend(["", "By market:", "\n".join(market_lines)])
 
     if summary["skipped_reasons"]:
@@ -555,6 +730,8 @@ def build_alert_details(alert_id):
         f"Game Spot: {alert.get('game_spot', 'n/a')}",
         f"Bases: {alert.get('base_state', 'n/a')}",
         f"Why: {alert.get('passed_reason', 'n/a')}",
+        "",
+        alert.get("early_explanation", ""),
     ]
     return "\n".join(lines)
 
@@ -619,8 +796,10 @@ def subscription_message():
         "Commands:\n"
         "/status - check status\n"
         "/recap - show recent alert results\n"
+        "/markets - show market availability\n"
         "/pending - show open tracked alerts\n"
         "/details ID - show alert breakdown\n"
+        "/settle ID - quick report an alert result\n"
         "/win ID, /loss ID, /push ID, /nomarket ID - report an alert result\n"
         "/stop - stop alerts\n"
         "/join - restart alerts"
@@ -641,6 +820,7 @@ def outcome_response(alert, outcome):
         "loss": "loss",
         "push": "push/void",
         "no_market": "no market/locked",
+        "didnt_bet": "didn't bet",
     }
     return (
         f"Recorded {labels.get(outcome, outcome)} for {alert['id']}.\n\n"
@@ -679,6 +859,11 @@ def check_telegram_messages():
         if not chat_id:
             continue
 
+        settlement_response = handle_settlement_reply(chat_id, text)
+        if settlement_response and not command.startswith("/"):
+            send_telegram(chat_id, settlement_response)
+            continue
+
         if command in ["/start", "/join"]:
             if save_subscriber(chat_id, username, first_name, "active"):
                 send_telegram(chat_id, subscription_message())
@@ -704,6 +889,9 @@ def check_telegram_messages():
         elif command in ["/recap", "/results"]:
             send_telegram(chat_id, build_results_recap())
 
+        elif command == "/markets":
+            send_telegram(chat_id, build_market_report())
+
         elif command == "/pending":
             send_telegram(chat_id, build_pending_alerts())
 
@@ -715,6 +903,16 @@ def check_telegram_messages():
                 )
                 continue
             send_telegram(chat_id, build_alert_details(args[0]))
+
+        elif command == "/settle":
+            if not args:
+                send_telegram(
+                    chat_id,
+                    "Send the alert ID too. Example: /settle 0624-823850-1T-GR-673962",
+                )
+                continue
+            pending_settlements[str(chat_id)] = args[0]
+            send_telegram(chat_id, settlement_prompt(args[0]))
 
         elif command in OUTCOME_COMMANDS:
             if not args:
@@ -741,8 +939,10 @@ def check_telegram_messages():
                 "Send /join to activate alerts.\n"
                 "Send /status to check status.\n"
                 "Send /recap to see results.\n"
+                "Send /markets to see market availability.\n"
                 "Send /pending to see open alerts.\n"
                 "Send /details ID to see alert breakdown.\n"
+                "Send /settle ID to quickly report a result.\n"
                 "Send /stop to stop alerts.",
             )
 
@@ -1351,6 +1551,10 @@ def top_player_markets(
         ("Player RBI", player_score["rbi"], f"{name} RBI"),
         ("Player Home Run", player_score["hr"], f"{name} Home Run"),
     ]
+    markets = [
+        (market, calibrated_market_score(market, score), label)
+        for market, score, label in markets
+    ]
 
     filtered = []
     best_score = max((score for _, score, _ in markets), default=0)
@@ -1573,12 +1777,14 @@ def build_candidate_record(
         "team": team,
         "market": market_name,
         "score": display_score(score),
+        "pressure": player_score.get("pressure_score", ""),
         "tier": tier,
         "sent": bool(sent),
         "skip_reason": skip_reason,
         "inning": inning,
         "outs": outs,
         "bases": base_text,
+        "bases_loaded": base_text == "Bases loaded",
         "batters_away": target.get("batters_away", ""),
         "pitcher": pitcher_obj.get("name", ""),
         "pitcher_id": pitcher_obj.get("id", ""),
@@ -1608,6 +1814,22 @@ def build_pass_reasons(player_score, pitcher, pressure_score, base_text):
     if player_score.get("quality_gate"):
         reasons.append("Player quality gate passed")
     return reasons[:4]
+
+
+def build_early_explanation(current_batter, targets, target):
+    current_name = current_batter.get("fullName") or current_batter.get("name") or "Current batter"
+    on_deck = next((item for item in targets if item.get("batters_away") == 1), None)
+    on_deck_name = on_deck.get("name") if on_deck else "Unknown"
+    return (
+        "WHY THIS ALERT IS EARLY\n"
+        f"{target['name']}\n"
+        f"{target['batters_away']} batters away\n\n"
+        f"Current batter: {current_name}\n"
+        f"On deck: {on_deck_name}\n"
+        f"Target: {target['name']}\n\n"
+        "Markets usually disappear when the batter is on deck.\n"
+        "This alert fired early to preserve market availability."
+    )
 
 
 def build_get_ready_alert(
@@ -1659,7 +1881,8 @@ def build_get_ready_alert(
         f"{base_text}\n\n"
         "Why It Passed:\n"
         f"{reason_lines}\n"
-        f"Tier: {tier}"
+        f"Tier: {tier}\n\n"
+        f"{target_score.get('early_explanation', '')}"
     )
 
 
@@ -1711,7 +1934,8 @@ def build_matchup_alert(
         f"{base_text}\n\n"
         "Why It Passed:\n"
         f"{reason_lines}\n"
-        f"Tier: {tier}"
+        f"Tier: {tier}\n\n"
+        f"{target_score.get('early_explanation', '')}"
     )
 
 
@@ -1797,6 +2021,7 @@ def check_game(game_pk):
             inning=inning,
             inning_pressure=inning_pressure,
         )
+        player_score["pressure_score"] = display_score(pressure_score)
         player_score["qualified_score"] = best_qualified_market_score(
             player_score,
             min_score=MIN_PLAYER_MARKET_SCORE,
@@ -1928,6 +2153,7 @@ def check_game(game_pk):
         alert_tier_value = "GOLD"
         best_target["tier"] = alert_tier_value
         best_target["passed_reasons"] = build_pass_reasons(best_target, pitcher, pressure_score, base_text)
+        best_target["early_explanation"] = build_early_explanation(offense.get("batter", {}), targets, best_target["target"])
         msg = build_get_ready_alert(
             team,
             best_target,
@@ -1953,6 +2179,7 @@ def check_game(game_pk):
         alert_tier_value = alert_tier(alert_score, pressure_score, alert_type)
         best_target["tier"] = alert_tier_value
         best_target["passed_reasons"] = build_pass_reasons(best_target, pitcher, pressure_score, base_text)
+        best_target["early_explanation"] = build_early_explanation(offense.get("batter", {}), targets, best_target["target"])
         msg = build_get_ready_alert(
             team,
             best_target,
@@ -1978,6 +2205,7 @@ def check_game(game_pk):
         alert_tier_value = alert_tier(alert_score, pressure_score, alert_type)
         best_target["tier"] = alert_tier_value
         best_target["passed_reasons"] = build_pass_reasons(best_target, pitcher, pressure_score, base_text)
+        best_target["early_explanation"] = build_early_explanation(offense.get("batter", {}), targets, best_target["target"])
         msg = build_matchup_alert(
             team,
             best_target,
@@ -2117,6 +2345,7 @@ def check_game(game_pk):
             alert_market[0] if alert_market else "",
         ),
         "passed_reason": "; ".join(best_target.get("passed_reasons", [])),
+        "early_explanation": best_target.get("early_explanation", ""),
         "pressure_score": display_score(pressure_score),
         "game_spot": game_spot,
         "base_state": base_text,
