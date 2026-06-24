@@ -72,6 +72,16 @@ class ScoringTests(unittest.TestCase):
         self.assertFalse(main.player_quality_gate({"ops": .800, "slg": .450, "pa": 20}))
         self.assertTrue(main.player_quality_gate({"ops": .800, "slg": .450, "pa": 200}))
 
+    def test_american_odds_units_and_score_bands(self):
+        self.assertEqual(main.parse_american_odds("+180"), 180)
+        self.assertEqual(main.parse_american_odds("-110"), -110)
+        self.assertAlmostEqual(main.units_for_result("win", "+180"), 1.8)
+        self.assertAlmostEqual(main.units_for_result("win", "-200"), .5)
+        self.assertEqual(main.units_for_result("loss", "-110"), -1)
+        self.assertEqual(main.score_band(95), "95+")
+        self.assertEqual(main.score_band(93), "92-94")
+        self.assertEqual(main.score_band(90), "90-91")
+
 
 class CacheTests(unittest.TestCase):
     def test_cache_get_expires_old_entry(self):
@@ -161,6 +171,20 @@ class AlertQualityFilterTests(unittest.TestCase):
         )
 
         self.assertEqual(markets[0][0], "Player H+R+RBI")
+
+    def test_disabled_market_is_removed_from_ranking(self):
+        player_score = self.make_player_score()
+        player_score["power_profile"] = True
+
+        with patch.object(main, "MARKET_ENABLED_HRR", False):
+            markets = main.top_player_markets(
+                player_score,
+                min_score=90,
+                max_markets=2,
+                runners_on=True,
+            )
+
+        self.assertNotIn("Player H+R+RBI", [market[0] for market in markets])
 
     def test_pitcher_context_requires_weakness_or_bases_loaded_pressure(self):
         strong_pitcher = {"weakness": -12}
@@ -271,6 +295,8 @@ class ResultTrackingTests(unittest.TestCase):
                         "best_market": "Player RBI",
                         "score": 91,
                         "sent": True,
+                        "batters_away": 3,
+                        "inning": 5,
                         "status": "open",
                     })
                     main.record_alert_outcome("alert-1", "no_market", "123")
@@ -279,6 +305,8 @@ class ResultTrackingTests(unittest.TestCase):
 
                 self.assertIn("Player RBI", report)
                 self.assertIn("Availability Rate: 0.0%", report)
+                self.assertIn("3: 0.0% available", report)
+                self.assertIn("5: 0.0% available", report)
 
     def test_settlement_reply_records_result(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -295,10 +323,14 @@ class ResultTrackingTests(unittest.TestCase):
                     })
 
                     main.pending_settlements["123"] = "alert-1"
-                    response = main.handle_settlement_reply("123", "4")
+                    response = main.handle_settlement_reply("123", "1 +180")
 
-                self.assertIn("Recorded no market/locked", response)
+                self.assertIn("Recorded win", response)
                 self.assertNotIn("123", main.pending_settlements)
+
+                alert = main.find_alert("alert-1")
+                self.assertEqual(alert["odds"], 180)
+                self.assertAlmostEqual(alert["profit_units"], 1.8)
 
     def test_market_penalty_reduces_low_availability_market(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -388,6 +420,31 @@ class ResultTrackingTests(unittest.TestCase):
                 self.assertIn("Debug Breakdown", details)
                 self.assertIn("AVG: 0.300", details)
                 self.assertIn("Pitcher Weakness: 26", details)
+
+    def test_recap_includes_roi_score_bands_and_lineup_position(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                with patch.object(main, "post_sheet_event", return_value=True):
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "GET_READY",
+                        "target": "Test Player",
+                        "best_market": "Player Hits",
+                        "score": 95,
+                        "lineup_position": 3,
+                        "sent": True,
+                        "status": "open",
+                    })
+                    main.record_alert_outcome("alert-1", "win", "123", odds="+180")
+
+                recap = main.build_results_recap(days=1)
+
+                self.assertIn("Units: +1.80", recap)
+                self.assertIn("ROI: 180.0%", recap)
+                self.assertIn("95+: 1-0-0", recap)
+                self.assertIn("#3: 100.0% win", recap)
 
 
 class LiveFeedParsingTests(unittest.TestCase):

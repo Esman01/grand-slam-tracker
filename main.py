@@ -53,6 +53,11 @@ MIN_POWER_SLG_FOR_HR = float(os.getenv("MIN_POWER_SLG_FOR_HR", ".450"))
 MIN_POWER_HR_RATE = float(os.getenv("MIN_POWER_HR_RATE", ".035"))
 SEND_SILVER_ALERTS = os.getenv("SEND_SILVER_ALERTS", "false").lower() == "true"
 SHOW_DEBUG = os.getenv("SHOW_DEBUG", "false").lower() == "true"
+MARKET_ENABLED_HRR = os.getenv("MARKET_ENABLED_HRR", "true").lower() == "true"
+MARKET_ENABLED_TOTAL_BASES = os.getenv("MARKET_ENABLED_TOTAL_BASES", "true").lower() == "true"
+MARKET_ENABLED_HITS = os.getenv("MARKET_ENABLED_HITS", "true").lower() == "true"
+MARKET_ENABLED_RBI = os.getenv("MARKET_ENABLED_RBI", "true").lower() == "true"
+MARKET_ENABLED_HR = os.getenv("MARKET_ENABLED_HR", "true").lower() == "true"
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 STATS_CACHE_SECONDS = int(os.getenv("STATS_CACHE_SECONDS", "900"))
@@ -238,6 +243,51 @@ def parse_iso_datetime(value):
         return datetime.min
 
 
+def parse_american_odds(value):
+    if value in [None, ""]:
+        return None
+    text = str(value).strip().replace("−", "-")
+    if not text:
+        return None
+    if text.startswith("+"):
+        text = text[1:]
+    try:
+        odds = int(text)
+    except ValueError:
+        return None
+    if -100 < odds < 100:
+        return None
+    return odds
+
+
+def units_for_result(outcome, odds, stake=1.0):
+    odds = parse_american_odds(odds)
+    if outcome == "win":
+        if odds is None:
+            return stake
+        if odds > 0:
+            return stake * odds / 100
+        return stake * 100 / abs(odds)
+    if outcome == "loss":
+        return -stake
+    if outcome in ["push", "no_market", "didnt_bet"]:
+        return 0
+    return 0
+
+
+def score_band(score):
+    score = display_score(score)
+    if score >= 95:
+        return "95+"
+    if score >= 92:
+        return "92-94"
+    if score >= 90:
+        return "90-91"
+    if score >= 85:
+        return "85-89"
+    return "Under 85"
+
+
 def load_result_store():
     try:
         with open(RESULTS_FILE, "r", encoding="utf-8") as handle:
@@ -347,13 +397,18 @@ def record_alert(alert):
     post_sheet_event(payload)
 
 
-def record_alert_outcome(alert_id, outcome, reported_by):
+def record_alert_outcome(alert_id, outcome, reported_by, odds=None):
     store = load_result_store()
     for alert in store.get("alerts", []):
         if str(alert.get("id")).lower() == str(alert_id).lower():
             alert["status"] = outcome
             alert["outcome_at"] = utc_now().isoformat()
             alert["reported_by"] = str(reported_by)
+            parsed_odds = parse_american_odds(odds)
+            if parsed_odds is not None:
+                alert["odds"] = parsed_odds
+            alert["stake_units"] = 1
+            alert["profit_units"] = units_for_result(outcome, alert.get("odds"))
             save_result_store(store)
             post_sheet_event({
                 "kind": "alert_result",
@@ -362,6 +417,8 @@ def record_alert_outcome(alert_id, outcome, reported_by):
                 "outcome": outcome,
                 "outcome_at": alert["outcome_at"],
                 "reported_by": alert["reported_by"],
+                "odds": alert.get("odds", ""),
+                "profit_units": alert.get("profit_units", 0),
             })
             return alert
     return None
@@ -382,7 +439,8 @@ def settlement_prompt(alert_id):
         "3. Push\n"
         "4. No Market\n"
         "5. Didn't Bet\n\n"
-        "Reply with 1, 2, 3, 4, or 5."
+        "Reply with 1, 2, 3, 4, or 5.\n"
+        "You can include odds too, like: 1 +180"
     )
 
 
@@ -391,7 +449,9 @@ def handle_settlement_reply(chat_id, text):
     if not alert_id:
         return None
 
-    choice = SETTLE_CHOICES.get((text or "").strip().lower())
+    parts = (text or "").strip().split()
+    choice = SETTLE_CHOICES.get(parts[0].lower() if parts else "")
+    odds = parse_american_odds(parts[1]) if len(parts) > 1 else None
     if not choice:
         return (
             "Reply with 1, 2, 3, 4, or 5.\n\n"
@@ -399,7 +459,7 @@ def handle_settlement_reply(chat_id, text):
         )
 
     pending_settlements.pop(str(chat_id), None)
-    alert = record_alert_outcome(alert_id, choice, chat_id)
+    alert = record_alert_outcome(alert_id, choice, chat_id, odds=odds)
     if not alert:
         return f"I couldn't find alert ID {alert_id}.\n\n{build_pending_alerts()}"
     return outcome_response(alert, choice)
@@ -419,9 +479,14 @@ def summarize_results(days=1, now=None):
         "didnt_bet": 0,
         "by_type": {},
         "by_market": {},
+        "by_lineup_position": {},
         "skipped_reasons": {},
         "winner_scores": [],
         "loser_scores": [],
+        "profit_units": 0,
+        "risked_units": 0,
+        "odds_values": [],
+        "by_score_band": {},
         "recent": [],
     }
 
@@ -451,14 +516,14 @@ def summarize_results(days=1, now=None):
         summary[status] = summary.get(status, 0) + 1
         type_summary = summary["by_type"].setdefault(
             alert_type,
-            {"total": 0, "win": 0, "loss": 0, "push": 0, "no_market": 0},
+            {"total": 0, "win": 0, "loss": 0, "push": 0, "no_market": 0, "didnt_bet": 0},
         )
         type_summary["total"] += 1
         if status in type_summary:
             type_summary[status] += 1
         market_summary = summary["by_market"].setdefault(
             market,
-            {"total": 0, "win": 0, "loss": 0, "push": 0, "no_market": 0},
+            {"total": 0, "win": 0, "loss": 0, "push": 0, "no_market": 0, "didnt_bet": 0},
         )
         market_summary["total"] += 1
         if status in market_summary:
@@ -467,6 +532,35 @@ def summarize_results(days=1, now=None):
             summary["winner_scores"].append(safe_float(alert.get("score")))
         if status == "loss":
             summary["loser_scores"].append(safe_float(alert.get("score")))
+        if status in ["win", "loss"]:
+            summary["risked_units"] += safe_float(alert.get("stake_units"), 1)
+            summary["profit_units"] += safe_float(
+                alert.get("profit_units"),
+                units_for_result(status, alert.get("odds")),
+            )
+            odds = parse_american_odds(alert.get("odds"))
+            if odds is not None:
+                summary["odds_values"].append(odds)
+
+        band = score_band(alert.get("score"))
+        band_summary = summary["by_score_band"].setdefault(
+            band,
+            {"total": 0, "win": 0, "loss": 0, "push": 0, "no_market": 0, "didnt_bet": 0},
+        )
+        band_summary["total"] += 1
+        if status in band_summary:
+            band_summary[status] += 1
+
+        lineup_position = alert.get("lineup_position")
+        if lineup_position:
+            lineup_key = f"#{safe_int(lineup_position)}"
+            lineup_summary = summary["by_lineup_position"].setdefault(
+                lineup_key,
+                {"total": 0, "win": 0, "loss": 0, "push": 0, "no_market": 0, "didnt_bet": 0},
+            )
+            lineup_summary["total"] += 1
+            if status in lineup_summary:
+                lineup_summary[status] += 1
 
         if len(summary["recent"]) < MAX_RECAP_ITEMS:
             summary["recent"].append(alert)
@@ -507,6 +601,8 @@ def build_market_stats(days=RESULTS_RECAP_DAYS, now=None):
                 "push": 0,
                 "no_market": 0,
                 "didnt_bet": 0,
+                "by_distance": {},
+                "by_inning": {},
             },
         )
         item["sent"] += 1
@@ -514,6 +610,17 @@ def build_market_stats(days=RESULTS_RECAP_DAYS, now=None):
             item["available"] += 1
         if status in item:
             item[status] += 1
+        distance = str(alert.get("batters_away", "unknown"))
+        distance_item = item["by_distance"].setdefault(distance, {"sent": 0, "available": 0})
+        distance_item["sent"] += 1
+        if status != "no_market":
+            distance_item["available"] += 1
+
+        inning = str(alert.get("inning", "unknown"))
+        inning_item = item["by_inning"].setdefault(inning, {"sent": 0, "available": 0})
+        inning_item["sent"] += 1
+        if status != "no_market":
+            inning_item["available"] += 1
 
     return stats
 
@@ -537,6 +644,16 @@ def build_market_report(days=RESULTS_RECAP_DAYS):
             f"Win Rate: {win_rate:.1f}%" if graded else "Win Rate: not enough graded alerts",
             f"No Market: {item['no_market']}",
         ])
+        if item["by_distance"]:
+            lines.append("By batters away:")
+            for distance, dist_item in sorted(item["by_distance"].items()):
+                rate = (dist_item["available"] / dist_item["sent"] * 100) if dist_item["sent"] else 0
+                lines.append(f"{distance}: {rate:.1f}% available ({dist_item['sent']} sent)")
+        if item["by_inning"]:
+            lines.append("By inning:")
+            for inning, inning_item in sorted(item["by_inning"].items(), key=lambda row: safe_int(row[0], 99)):
+                rate = (inning_item["available"] / inning_item["sent"] * 100) if inning_item["sent"] else 0
+                lines.append(f"{inning}: {rate:.1f}% available ({inning_item['sent']} sent)")
     return "\n".join(lines)
 
 
@@ -592,6 +709,12 @@ def build_results_recap(days=RESULTS_RECAP_DAYS):
     summary = summarize_results(days)
     graded = summary["win"] + summary["loss"]
     win_rate = (summary["win"] / graded * 100) if graded else 0
+    roi = (summary["profit_units"] / summary["risked_units"] * 100) if summary["risked_units"] else 0
+    avg_odds = (
+        sum(summary["odds_values"]) / len(summary["odds_values"])
+        if summary["odds_values"]
+        else 0
+    )
 
     lines = [
         f"Results recap: last {days} day(s)",
@@ -602,6 +725,9 @@ def build_results_recap(days=RESULTS_RECAP_DAYS):
         f"Didn't bet: {summary['didnt_bet']}",
         f"Still open: {summary['open']}",
         f"Win rate: {win_rate:.1f}%" if graded else "Win rate: not enough graded alerts",
+        f"Units: {summary['profit_units']:+.2f}",
+        f"ROI: {roi:.1f}%" if summary["risked_units"] else "ROI: not enough odds/results",
+        f"Average odds: {avg_odds:+.0f}" if summary["odds_values"] else "Average odds: n/a",
     ]
 
     if summary["by_type"]:
@@ -629,6 +755,36 @@ def build_results_recap(days=RESULTS_RECAP_DAYS):
             else:
                 market_lines.append(f"{market}: no graded bets | {availability_rate:.1f}% available")
         lines.extend(["", "By market:", "\n".join(market_lines)])
+
+    if summary["by_score_band"]:
+        band_order = ["95+", "92-94", "90-91", "85-89", "Under 85"]
+        band_lines = []
+        for band in band_order:
+            info = summary["by_score_band"].get(band)
+            if not info:
+                continue
+            band_lines.append(
+                f"{band}: {info['win']}-{info['loss']}-{info['push']} "
+                f"({info['total']} sent)"
+            )
+        if band_lines:
+            lines.extend(["", "Confidence calibration:", "\n".join(band_lines)])
+
+    if summary["by_lineup_position"]:
+        lineup_lines = []
+        for position, info in sorted(
+            summary["by_lineup_position"].items(),
+            key=lambda row: safe_int(row[0].replace("#", ""), 99),
+        ):
+            graded_position = info["win"] + info["loss"]
+            position_win_rate = (info["win"] / graded_position * 100) if graded_position else 0
+            if graded_position:
+                lineup_lines.append(
+                    f"{position}: {position_win_rate:.1f}% win ({info['total']} sent)"
+                )
+            else:
+                lineup_lines.append(f"{position}: no graded bets ({info['total']} sent)")
+        lines.extend(["", "By lineup position:", "\n".join(lineup_lines)])
 
     if summary["skipped_reasons"]:
         skipped_lines = [
@@ -712,6 +868,8 @@ def build_alert_details(alert_id):
         f"Tier: {alert.get('tier', 'n/a')}",
         f"Best Market: {alert.get('best_market', 'n/a')}",
         f"Final Score: {alert.get('score', 'n/a')}",
+        f"Odds: {alert.get('odds', 'n/a')}",
+        f"Profit Units: {safe_float(alert.get('profit_units')):+.2f}",
         f"Pressure: {alert.get('pressure_score', 'n/a')}",
         f"Market Confidence: {alert.get('market_confidence', 'n/a')}",
         f"Availability Risk: {alert.get('market_availability_risk', 'n/a')}",
@@ -923,7 +1081,8 @@ def check_telegram_messages():
                 continue
 
             outcome = OUTCOME_COMMANDS[command]
-            alert = record_alert_outcome(args[0], outcome, chat_id)
+            odds = args[1] if len(args) > 1 else None
+            alert = record_alert_outcome(args[0], outcome, chat_id, odds=odds)
             if alert:
                 send_telegram(chat_id, outcome_response(alert, outcome))
             else:
@@ -1410,6 +1569,7 @@ def get_batting_order_targets(data, lookahead=4):
             "name": person.get("fullName", "Unknown"),
             "role": role,
             "batters_away": offset,
+            "lineup_position": idx + 1,
         })
 
     return targets
@@ -1550,6 +1710,18 @@ def top_player_markets(
         ("Player Hits", player_score["hit"], f"{name} 1+ Hit"),
         ("Player RBI", player_score["rbi"], f"{name} RBI"),
         ("Player Home Run", player_score["hr"], f"{name} Home Run"),
+    ]
+    enabled = {
+        "Player H+R+RBI": MARKET_ENABLED_HRR,
+        "Player Total Bases": MARKET_ENABLED_TOTAL_BASES,
+        "Player Hits": MARKET_ENABLED_HITS,
+        "Player RBI": MARKET_ENABLED_RBI,
+        "Player Home Run": MARKET_ENABLED_HR,
+    }
+    markets = [
+        (market, score, label)
+        for market, score, label in markets
+        if enabled.get(market, True)
     ]
     markets = [
         (market, calibrated_market_score(market, score), label)
@@ -1786,6 +1958,7 @@ def build_candidate_record(
         "bases": base_text,
         "bases_loaded": base_text == "Bases loaded",
         "batters_away": target.get("batters_away", ""),
+        "lineup_position": target.get("lineup_position", ""),
         "pitcher": pitcher_obj.get("name", ""),
         "pitcher_id": pitcher_obj.get("id", ""),
         "pitcher_era": pitcher.get("era"),
@@ -2334,6 +2507,10 @@ def check_game(game_pk):
         "target": best_target["target"]["name"],
         "target_role": best_target["target"]["role"],
         "target_id": best_target["target"]["id"],
+        "batters_away": best_target["target"].get("batters_away"),
+        "lineup_position": best_target["target"].get("lineup_position"),
+        "inning": inning,
+        "outs": outs,
         "score": display_score(alert_score),
         "tier": alert_tier_value,
         "sent": True,

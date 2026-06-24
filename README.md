@@ -61,6 +61,11 @@ Optional:
 - `MIN_POWER_HR_RATE`: Minimum HR rate for HR markets to stay uncapped. Default: `.035`.
 - `SEND_SILVER_ALERTS`: Send SILVER alerts. Default: `false`.
 - `SHOW_DEBUG`: Include raw debug stats in Telegram messages. Default: `false`.
+- `MARKET_ENABLED_HRR`: Enable Hits+Runs+RBIs recommendations. Default: `true`.
+- `MARKET_ENABLED_TOTAL_BASES`: Enable Total Bases recommendations. Default: `true`.
+- `MARKET_ENABLED_HITS`: Enable Hits recommendations. Default: `true`.
+- `MARKET_ENABLED_RBI`: Enable RBI recommendations. Default: `true`.
+- `MARKET_ENABLED_HR`: Enable Home Run recommendations. Default: `true`.
 - `FRESH_INJURY_DAYS`: Injury transaction lookback. Default: `14`.
 - `STATS_CACHE_SECONDS`: Player stats cache TTL. Default: `900`.
 - `INJURY_CACHE_SECONDS`: Injury cache TTL. Default: `3600`.
@@ -100,7 +105,9 @@ Alerts are tiered as `GOLD`, `SILVER`, or `WATCHLIST`. Telegram sends `GOLD` by 
 
 Telegram alert copy is intentionally short: player/team, best bet, backup bet when strong enough, find path, game spot, why it passed, why the alert is early, and tracking ID. Raw stats and model breakdowns are hidden behind `/details ID`.
 
-`/recap` includes sent alerts, record, win rate by alert type, market availability rate, top skipped reasons, and average score of winners versus losers. `/markets` focuses only on market availability. `/pending` only shows ungraded sent alerts.
+Result commands accept optional American odds, such as `/win ID +180` or `/loss ID -110`. `/settle ID` also accepts odds in the reply, such as `1 +180`.
+
+`/recap` includes sent alerts, record, units, ROI, average odds, confidence calibration by score band, lineup-position results, market availability rate, top skipped reasons, and average score of winners versus losers. `/markets` focuses on market availability by market, batters away, and inning. `/pending` only shows ungraded sent alerts.
 
 ## Local setup
 
