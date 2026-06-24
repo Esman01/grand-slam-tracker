@@ -174,6 +174,11 @@ class AlertQualityFilterTests(unittest.TestCase):
         self.assertTrue(main.is_low_quality_timing(2, 2))
         self.assertFalse(main.is_low_quality_timing(1, 2))
 
+    def test_cold_opening_context_blocks_empty_first_inning(self):
+        self.assertTrue(main.cold_opening_context(1, {}, 69))
+        self.assertFalse(main.cold_opening_context(1, {"first": {}}, 69))
+        self.assertFalse(main.cold_opening_context(1, {}, 94))
+
     def test_alert_tier_sends_gold_but_not_watchlist(self):
         self.assertEqual(main.alert_tier(94, 80, "MATCHUP"), "GOLD")
         self.assertEqual(main.alert_tier(90, 70, "MATCHUP"), "SILVER")
@@ -276,6 +281,36 @@ class ResultTrackingTests(unittest.TestCase):
                     self.assertEqual(payload["kind"], "alert_result")
                     self.assertEqual(payload["alert_id"], "alert-1")
                     self.assertEqual(payload["status"], "win")
+
+    def test_build_alert_details_reads_hidden_breakdown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_file = os.path.join(temp_dir, "results.json")
+            with patch.object(main, "RESULTS_FILE", result_file):
+                with patch.object(main, "post_sheet_event", return_value=True):
+                    main.record_alert({
+                        "id": "alert-1",
+                        "sent_at": main.utc_now().isoformat(),
+                        "alert_type": "GET_READY",
+                        "target": "Test Player",
+                        "best_market": "Player Hits",
+                        "score": 95,
+                        "pressure_score": 69,
+                        "player_avg": .300,
+                        "player_obp": .360,
+                        "player_slg": .443,
+                        "player_ops": .803,
+                        "player_pa": 120,
+                        "pitcher": "Test Pitcher",
+                        "pitcher_weakness": 26,
+                        "timing_boost": 10,
+                        "status": "open",
+                    })
+
+                details = main.build_alert_details("alert-1")
+
+                self.assertIn("Debug Breakdown", details)
+                self.assertIn("AVG: 0.300", details)
+                self.assertIn("Pitcher Weakness: 26", details)
 
 
 class LiveFeedParsingTests(unittest.TestCase):

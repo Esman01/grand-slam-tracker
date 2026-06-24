@@ -71,6 +71,7 @@ Optional:
 - `/status`: Check subscription status.
 - `/pending`: Show open tracked alerts.
 - `/recap`: Show recent performance.
+- `/details ID`: Show the hidden debug breakdown for one alert.
 - `/win ID`: Mark an alert as a win.
 - `/loss ID`: Mark an alert as a loss.
 - `/push ID`: Mark an alert as a push/void.
@@ -84,9 +85,11 @@ The same `SHEET_WEBHOOK_URL` handles subscribers and alert telemetry. Alert crea
 
 ## Alert quality filters
 
-Player alerts only list markets that clear the configured market threshold, so weaker watch-list picks are omitted. The bot also skips low-pressure spots, two-strike/two-out timing, poor hitter profiles, unreliable pitcher samples, and strong-pitcher situations unless pressure is extreme.
+Player alerts only list markets that clear the configured market threshold, so weaker watch-list picks are omitted. The bot also skips low-pressure spots, two-strike/two-out timing, poor hitter profiles, unreliable pitcher samples, first-inning bases-empty player spots, and strong-pitcher situations unless pressure is extreme.
 
 Alerts are tiered as `GOLD`, `SILVER`, or `WATCHLIST`. Telegram sends `GOLD` by default, sends `SILVER` only when enabled, and logs `WATCHLIST` candidates without sending them. Market ranking favors Hits+Runs+RBIs, Total Bases, and Hits before RBI or Home Run. Home Run markets only appear when the score is elite and the player has a real power profile.
+
+Telegram alert copy is intentionally short: player/team, best bet, backup bet when strong enough, find path, game spot, why it passed, and tracking ID. Raw stats and model breakdowns are hidden behind `/details ID`.
 
 `/recap` includes sent alerts, record, win rate by alert type, win rate and no-market rate by market, top skipped reasons, and average score of winners versus losers. `/pending` only shows ungraded sent alerts.
 
