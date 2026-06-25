@@ -111,7 +111,7 @@ Result commands accept optional American odds, such as `/win ID +180` or `/loss 
 
 `/recap` includes sent alerts, record, units, ROI, average odds, confidence calibration by score band, lineup-position results, market availability rate, top skipped reasons, and average score of winners versus losers. `/markets` focuses on market availability by market, batters away, and inning. `/pending` only shows ungraded sent alerts.
 
-Settled sportsbook bets can be logged without an alert ID using `/trainbet`, for example `/trainbet win +340 1 Player Hits | Sam Antonacci 2+ hits`. These records are stored in `bet_training.json`, shown in `/training`, and can penalize markets that show negative ROI after enough samples. This lets real bet history tune future scoring even when a bet cannot be perfectly matched back to a Telegram alert.
+Settled sportsbook bets can be logged without an alert ID using `/trainbet`, for example `/trainbet win +340 1 Player Hits | Sam Antonacci 2+ hits`. These records are stored in `bet_training.json`, shown in `/training`, and can penalize markets that show negative ROI after enough samples. Screenshot history can also be manually converted into `bet_training.json` when typing every result would be too slow. This lets real bet history tune future scoring even when a bet cannot be perfectly matched back to a Telegram alert.
 
 ## Local setup
 
