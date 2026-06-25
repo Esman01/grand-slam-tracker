@@ -71,6 +71,9 @@ MAX_RECAP_ITEMS = int(os.getenv("MAX_RECAP_ITEMS", "5"))
 MIN_TRAINING_BETS_PER_MARKET = int(os.getenv("MIN_TRAINING_BETS_PER_MARKET", "3"))
 TRAINING_MARKET_PENALTY_POINTS = int(os.getenv("TRAINING_MARKET_PENALTY_POINTS", "6"))
 TRAINING_BAD_ROI_THRESHOLD = float(os.getenv("TRAINING_BAD_ROI_THRESHOLD", "-.10"))
+USE_UNMATCHED_BETS_FOR_MARKET_TRAINING = (
+    os.getenv("USE_UNMATCHED_BETS_FOR_MARKET_TRAINING", "false").lower() == "true"
+)
 
 RECENT_INJURY_NAMES = [
     x.strip().lower()
@@ -318,7 +321,16 @@ def save_training_bets(bets):
     save_json_list(BET_HISTORY_FILE, bets)
 
 
-def record_training_bet(outcome, odds, stake=1.0, market="", note="", source="manual", placed_at=None):
+def record_training_bet(
+    outcome,
+    odds,
+    stake=1.0,
+    market="",
+    note="",
+    source="manual",
+    placed_at=None,
+    matched_alert_id="",
+):
     outcome = str(outcome or "").lower()
     if outcome not in ["win", "loss", "push", "no_market", "didnt_bet"]:
         return None
@@ -332,6 +344,8 @@ def record_training_bet(outcome, odds, stake=1.0, market="", note="", source="ma
         "market": normalize_market_name(market),
         "raw_market": str(market or ""),
         "note": str(note or ""),
+        "matched_alert_id": str(matched_alert_id or ""),
+        "match_status": "matched" if matched_alert_id else "no_match",
         "status": outcome,
         "odds": parsed_odds if parsed_odds is not None else "",
         "stake_units": stake_units,
@@ -345,7 +359,7 @@ def record_training_bet(outcome, odds, stake=1.0, market="", note="", source="ma
     return bet
 
 
-def summarize_training_bets(days=30, now=None):
+def summarize_training_bets(days=30, now=None, include_unmatched=True):
     now = now or utc_now()
     cutoff = now - timedelta(days=days)
     summary = {
@@ -357,16 +371,25 @@ def summarize_training_bets(days=30, now=None):
         "didnt_bet": 0,
         "risked_units": 0,
         "profit_units": 0,
+        "matched": 0,
+        "unmatched": 0,
         "by_market": {},
     }
 
     for bet in load_training_bets():
+        matched = bool(bet.get("matched_alert_id"))
+        if not include_unmatched and not matched:
+            continue
         recorded_at = parse_iso_datetime(bet.get("recorded_at"))
         if recorded_at < cutoff:
             continue
         status = bet.get("status", "open")
         market = normalize_market_name(bet.get("market") or bet.get("raw_market"))
         summary["total"] += 1
+        if matched:
+            summary["matched"] += 1
+        else:
+            summary["unmatched"] += 1
         summary[status] = summary.get(status, 0) + 1
         item = summary["by_market"].setdefault(
             market,
@@ -402,7 +425,10 @@ def training_market_penalty(market):
     if not AUTO_MARKET_PENALTIES or not market:
         return 0
 
-    item = summarize_training_bets(days=30)["by_market"].get(normalize_market_name(market))
+    item = summarize_training_bets(
+        days=30,
+        include_unmatched=USE_UNMATCHED_BETS_FOR_MARKET_TRAINING,
+    )["by_market"].get(normalize_market_name(market))
     if not item:
         return 0
     graded = item["win"] + item["loss"]
@@ -819,6 +845,8 @@ def build_training_report(days=30):
         f"Training bets: last {days} day(s)",
         "",
         f"Logged: {summary['total']}",
+        f"Matched bot alerts: {summary['matched']}",
+        f"Unmatched sportsbook bets: {summary['unmatched']}",
         f"Record: {summary['win']}-{summary['loss']}-{summary['push']}",
         f"No market: {summary['no_market']}",
         f"Win rate: {win_rate:.1f}%" if graded else "Win rate: not enough graded bets",

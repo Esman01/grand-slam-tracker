@@ -524,13 +524,35 @@ class ResultTrackingTests(unittest.TestCase):
             bet_file = os.path.join(temp_dir, "bets.json")
             with patch.object(main, "BET_HISTORY_FILE", bet_file):
                 with patch.object(main, "MIN_TRAINING_BETS_PER_MARKET", 2):
-                    main.record_training_bet("loss", "+600", stake=1, market="to hit a home run")
-                    main.record_training_bet("loss", "+1100", stake=1, market="home run")
+                    main.record_training_bet(
+                        "loss",
+                        "+600",
+                        stake=1,
+                        market="to hit a home run",
+                        matched_alert_id="alert-1",
+                    )
+                    main.record_training_bet(
+                        "loss",
+                        "+1100",
+                        stake=1,
+                        market="home run",
+                        matched_alert_id="alert-2",
+                    )
 
                     self.assertEqual(
                         main.training_market_penalty("Player Home Run"),
                         main.TRAINING_MARKET_PENALTY_POINTS,
                     )
+
+    def test_unmatched_training_bets_do_not_penalize_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bet_file = os.path.join(temp_dir, "bets.json")
+            with patch.object(main, "BET_HISTORY_FILE", bet_file):
+                with patch.object(main, "MIN_TRAINING_BETS_PER_MARKET", 2):
+                    main.record_training_bet("loss", "+600", stake=1, market="to hit a home run")
+                    main.record_training_bet("loss", "+1100", stake=1, market="home run")
+
+                    self.assertEqual(main.training_market_penalty("Player Home Run"), 0)
 
     def test_trainbet_parser_accepts_note_separator(self):
         parsed = main.parse_trainbet_args(
