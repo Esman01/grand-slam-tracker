@@ -29,11 +29,11 @@ MIN_TARGET_BATTERS_AWAY = int(os.getenv("MIN_TARGET_BATTERS_AWAY", "2"))
 MAX_TARGET_BATTERS_AWAY = int(os.getenv("MAX_TARGET_BATTERS_AWAY", "4"))
 PREFERRED_MARKET_DISTANCE = int(os.getenv("PREFERRED_MARKET_DISTANCE", "3"))
 
-MIN_GET_READY_SCORE = int(os.getenv("MIN_GET_READY_SCORE", "90"))
-MIN_MATCHUP_SCORE = int(os.getenv("MIN_MATCHUP_SCORE", "92"))
+MIN_GET_READY_SCORE = int(os.getenv("MIN_GET_READY_SCORE", "92"))
+MIN_MATCHUP_SCORE = int(os.getenv("MIN_MATCHUP_SCORE", "94"))
 MIN_PRESSURE_SCORE = int(os.getenv("MIN_PRESSURE_SCORE", "90"))
-MIN_PLAYER_MARKET_SCORE = int(os.getenv("MIN_PLAYER_MARKET_SCORE", "90"))
-MIN_MATCHUP_MARKET_SCORE = int(os.getenv("MIN_MATCHUP_MARKET_SCORE", "92"))
+MIN_PLAYER_MARKET_SCORE = int(os.getenv("MIN_PLAYER_MARKET_SCORE", "92"))
+MIN_MATCHUP_MARKET_SCORE = int(os.getenv("MIN_MATCHUP_MARKET_SCORE", "94"))
 MIN_ALERT_PRESSURE_SCORE = int(os.getenv("MIN_ALERT_PRESSURE_SCORE", "60"))
 STRONG_PITCHER_PRESSURE_SCORE = int(os.getenv("STRONG_PITCHER_PRESSURE_SCORE", "75"))
 MAX_MARKETS_PER_ALERT = int(os.getenv("MAX_MARKETS_PER_ALERT", "2"))
@@ -58,6 +58,12 @@ MARKET_ENABLED_TOTAL_BASES = os.getenv("MARKET_ENABLED_TOTAL_BASES", "true").low
 MARKET_ENABLED_HITS = os.getenv("MARKET_ENABLED_HITS", "true").lower() == "true"
 MARKET_ENABLED_RBI = os.getenv("MARKET_ENABLED_RBI", "true").lower() == "true"
 MARKET_ENABLED_HR = os.getenv("MARKET_ENABLED_HR", "true").lower() == "true"
+MIN_SAFE_MARKET_SCORE = int(os.getenv("MIN_SAFE_MARKET_SCORE", "92"))
+MIN_TOTAL_BASES_MARKET_SCORE = int(os.getenv("MIN_TOTAL_BASES_MARKET_SCORE", "94"))
+MIN_RBI_GEM_SCORE = int(os.getenv("MIN_RBI_GEM_SCORE", "96"))
+MIN_HR_GEM_SCORE = int(os.getenv("MIN_HR_GEM_SCORE", "97"))
+MIN_GEM_PITCHER_WEAKNESS = int(os.getenv("MIN_GEM_PITCHER_WEAKNESS", "8"))
+MIN_GEM_PRESSURE_SCORE = int(os.getenv("MIN_GEM_PRESSURE_SCORE", "75"))
 
 FRESH_INJURY_DAYS = int(os.getenv("FRESH_INJURY_DAYS", "14"))
 STATS_CACHE_SECONDS = int(os.getenv("STATS_CACHE_SECONDS", "900"))
@@ -2014,6 +2020,8 @@ def score_player_target(target, pitcher, pressure_score, offense=None, inning=0,
         "quality_gate": player_quality_gate(profile),
         "power_profile": has_power_profile(profile),
         "elite_profile": has_elite_player_profile(profile),
+        "pressure_score": pressure_score,
+        "pitcher_weakness": pitcher.get("weakness", 0),
         "hit": hit_market,
         "hrr": hrr_market,
         "rbi": rbi_market,
@@ -2054,6 +2062,8 @@ def top_player_markets(
     runners_on=True,
 ):
     name = player_score["target"]["name"]
+    pressure_score = safe_float(player_score.get("pressure_score"))
+    pitcher_weakness = safe_float(player_score.get("pitcher_weakness"))
 
     markets = [
         ("Player H+R+RBI", player_score["hrr"], f"{name} Hits+Runs+RBIs"),
@@ -2079,24 +2089,57 @@ def top_player_markets(
         for market, score, label in markets
     ]
 
-    filtered = []
+    eligible = []
     best_score = max((score for _, score, _ in markets), default=0)
+    best_safe_score = max(
+        (
+            score
+            for market, score, _ in markets
+            if market in ["Player H+R+RBI", "Player Hits", "Player Total Bases"]
+        ),
+        default=0,
+    )
+    market_floors = {
+        "Player H+R+RBI": max(min_score, MIN_SAFE_MARKET_SCORE),
+        "Player Hits": max(min_score, MIN_SAFE_MARKET_SCORE),
+        "Player Total Bases": max(min_score, MIN_TOTAL_BASES_MARKET_SCORE),
+        "Player RBI": max(min_score, MIN_RBI_GEM_SCORE),
+        "Player Home Run": max(min_score, MIN_HR_GEM_SCORE),
+    }
 
     for market, score, label in markets:
-        if score < max(min_score, MIN_MARKET_DISPLAY_SCORE):
+        if score < max(market_floors.get(market, min_score), MIN_MARKET_DISPLAY_SCORE):
             continue
-        if market in ["Player RBI", "Player Home Run"] and not runners_on:
+        if market == "Player RBI" and not runners_on:
             continue
+        if market == "Player RBI":
+            if pressure_score < MIN_GEM_PRESSURE_SCORE or pitcher_weakness < 0:
+                continue
         if market == "Player Home Run":
-            if score < 94 or not player_score.get("power_profile"):
+            if (
+                not player_score.get("power_profile")
+                or not player_score.get("elite_profile")
+                or pitcher_weakness < MIN_GEM_PITCHER_WEAKNESS
+            ):
                 continue
         if best_score - score > SECONDARY_MARKET_MAX_DROP:
             continue
-        filtered.append((market, score, label))
-        if len(filtered) >= max_markets:
-            break
+        eligible.append((market, score, label))
 
-    return filtered
+    market_priority = {
+        "Player H+R+RBI": 0,
+        "Player Hits": 1,
+        "Player Total Bases": 2,
+        "Player RBI": 3,
+        "Player Home Run": 4,
+    }
+
+    def ranking_key(item):
+        market, score, _ = item
+        is_gem = market in ["Player RBI", "Player Home Run"] and score >= best_safe_score + 3
+        return (0 if is_gem else 1, market_priority.get(market, 99), -score)
+
+    return sorted(eligible, key=ranking_key)[:max_markets]
 
 
 def best_qualified_market_score(player_score, min_score=MIN_PLAYER_MARKET_SCORE, runners_on=True):

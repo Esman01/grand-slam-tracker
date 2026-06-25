@@ -125,10 +125,14 @@ class AlertQualityFilterTests(unittest.TestCase):
         return {
             "target": {"name": "Test Hitter"},
             "hrr": 93,
-            "hit": 91,
+            "hit": 92,
             "total_bases": 86,
             "rbi": 92,
             "hr": 94,
+            "pressure_score": 80,
+            "pitcher_weakness": 10,
+            "power_profile": True,
+            "elite_profile": True,
         }
 
     def test_top_player_markets_limits_count_and_filters_empty_base_hr_rbi(self):
@@ -141,12 +145,28 @@ class AlertQualityFilterTests(unittest.TestCase):
 
         self.assertEqual([market[0] for market in markets], ["Player H+R+RBI", "Player Hits"])
 
-    def test_top_player_markets_omits_secondary_market_that_drops_too_far(self):
+    def test_rbi_requires_true_gem_score_even_with_runners(self):
         player_score = self.make_player_score()
         player_score["hrr"] = 89
         player_score["hit"] = 88
-        player_score["rbi"] = 90
-        player_score["power_profile"] = False
+        player_score["rbi"] = 95
+
+        markets = main.top_player_markets(
+            player_score,
+            min_score=90,
+            max_markets=3,
+            runners_on=True,
+        )
+
+        self.assertEqual(markets, [])
+
+    def test_rbi_gem_can_pass_with_runners_pressure_and_matchup(self):
+        player_score = self.make_player_score()
+        player_score["hrr"] = 89
+        player_score["hit"] = 88
+        player_score["rbi"] = 97
+        player_score["pressure_score"] = 86
+        player_score["pitcher_weakness"] = 12
 
         markets = main.top_player_markets(
             player_score,
@@ -157,11 +177,13 @@ class AlertQualityFilterTests(unittest.TestCase):
 
         self.assertEqual([market[0] for market in markets], ["Player RBI"])
 
-    def test_market_ranking_prefers_useful_markets_over_hr(self):
+    def test_obvious_hr_gem_can_lead_when_matchup_is_screaming(self):
         player_score = self.make_player_score()
         player_score["total_bases"] = 94
-        player_score["hr"] = 95
+        player_score["hr"] = 98
         player_score["power_profile"] = True
+        player_score["elite_profile"] = True
+        player_score["pitcher_weakness"] = 12
 
         markets = main.top_player_markets(
             player_score,
@@ -170,7 +192,21 @@ class AlertQualityFilterTests(unittest.TestCase):
             runners_on=True,
         )
 
-        self.assertEqual(markets[0][0], "Player H+R+RBI")
+        self.assertEqual(markets[0][0], "Player Home Run")
+
+    def test_hr_is_suppressed_without_obvious_matchup_support(self):
+        player_score = self.make_player_score()
+        player_score["hr"] = 98
+        player_score["pitcher_weakness"] = 2
+
+        markets = main.top_player_markets(
+            player_score,
+            min_score=90,
+            max_markets=3,
+            runners_on=True,
+        )
+
+        self.assertNotIn("Player Home Run", [market[0] for market in markets])
 
     def test_disabled_market_is_removed_from_ranking(self):
         player_score = self.make_player_score()
