@@ -84,6 +84,8 @@ Optional:
 - `/pending`: Show open tracked alerts.
 - `/recap`: Show recent performance.
 - `/markets`: Show market availability and no-market counts.
+- `/training`: Show settled bet training ROI by market.
+- `/trainbet RESULT ODDS STAKE MARKET | NOTE`: Log a settled sportsbook bet that may not have an alert ID.
 - `/details ID`: Show the hidden debug breakdown for one alert.
 - `/settle ID`: Start a quick result prompt.
 - `/win ID`: Mark an alert as a win.
@@ -108,6 +110,8 @@ Telegram alert copy is intentionally short: player/team, best bet, backup bet wh
 Result commands accept optional American odds, such as `/win ID +180` or `/loss ID -110`. `/settle ID` also accepts odds in the reply, such as `1 +180`.
 
 `/recap` includes sent alerts, record, units, ROI, average odds, confidence calibration by score band, lineup-position results, market availability rate, top skipped reasons, and average score of winners versus losers. `/markets` focuses on market availability by market, batters away, and inning. `/pending` only shows ungraded sent alerts.
+
+Settled sportsbook bets can be logged without an alert ID using `/trainbet`, for example `/trainbet win +340 1 Player Hits | Sam Antonacci 2+ hits`. These records are stored in `bet_training.json`, shown in `/training`, and can penalize markets that show negative ROI after enough samples. This lets real bet history tune future scoring even when a bet cannot be perfectly matched back to a Telegram alert.
 
 ## Local setup
 

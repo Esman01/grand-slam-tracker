@@ -65,8 +65,12 @@ INJURY_CACHE_SECONDS = int(os.getenv("INJURY_CACHE_SECONDS", "3600"))
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", ".telegram_offset")
 RESULTS_FILE = os.getenv("RESULTS_FILE", "alert_results.json")
 CANDIDATE_LOG_FILE = os.getenv("CANDIDATE_LOG_FILE", "candidate_log.json")
+BET_HISTORY_FILE = os.getenv("BET_HISTORY_FILE", "bet_training.json")
 RESULTS_RECAP_DAYS = int(os.getenv("RESULTS_RECAP_DAYS", "1"))
 MAX_RECAP_ITEMS = int(os.getenv("MAX_RECAP_ITEMS", "5"))
+MIN_TRAINING_BETS_PER_MARKET = int(os.getenv("MIN_TRAINING_BETS_PER_MARKET", "5"))
+TRAINING_MARKET_PENALTY_POINTS = int(os.getenv("TRAINING_MARKET_PENALTY_POINTS", "6"))
+TRAINING_BAD_ROI_THRESHOLD = float(os.getenv("TRAINING_BAD_ROI_THRESHOLD", "-.10"))
 
 RECENT_INJURY_NAMES = [
     x.strip().lower()
@@ -280,6 +284,134 @@ def units_for_result(outcome, odds, stake=1.0):
         return -stake
     if outcome in ["push", "no_market", "didnt_bet"]:
         return 0
+    return 0
+
+
+def normalize_market_name(value):
+    text = str(value or "").lower()
+    compact = text.replace("+", " plus ")
+
+    if "home run" in compact or "homer" in compact or " hr" in f" {compact}":
+        return "Player Home Run"
+    if "total bases" in compact:
+        return "Player Total Bases"
+    if "hits runs rbis" in compact or "hits plus runs plus rbis" in compact:
+        return "Player H+R+RBI"
+    if "h+r+rbi" in compact or "hrr" in compact:
+        return "Player H+R+RBI"
+    if "record a hit" in compact or " hit" in f" {compact}" or "hits" in compact:
+        return "Player Hits"
+    if "rbi" in compact:
+        return "Player RBI"
+    if "team total" in compact or "total runs" in compact or "over " in compact:
+        return "Team Total Over"
+    if "player hit" in compact or compact.strip() == "hits":
+        return "Player Hits"
+    return str(value or "UNKNOWN").strip() or "UNKNOWN"
+
+
+def load_training_bets():
+    return load_json_list(BET_HISTORY_FILE)
+
+
+def save_training_bets(bets):
+    save_json_list(BET_HISTORY_FILE, bets)
+
+
+def record_training_bet(outcome, odds, stake=1.0, market="", note="", source="manual", placed_at=None):
+    outcome = str(outcome or "").lower()
+    if outcome not in ["win", "loss", "push", "no_market", "didnt_bet"]:
+        return None
+
+    parsed_odds = parse_american_odds(odds)
+    stake_units = safe_float(stake, 1)
+    bet = {
+        "recorded_at": utc_now().isoformat(),
+        "placed_at": placed_at or "",
+        "source": source,
+        "market": normalize_market_name(market),
+        "raw_market": str(market or ""),
+        "note": str(note or ""),
+        "status": outcome,
+        "odds": parsed_odds if parsed_odds is not None else "",
+        "stake_units": stake_units,
+        "profit_units": units_for_result(outcome, parsed_odds, stake_units),
+    }
+    bets = load_training_bets()
+    bets.append(bet)
+    if len(bets) > 3000:
+        bets = bets[-3000:]
+    save_training_bets(bets)
+    return bet
+
+
+def summarize_training_bets(days=30, now=None):
+    now = now or utc_now()
+    cutoff = now - timedelta(days=days)
+    summary = {
+        "total": 0,
+        "win": 0,
+        "loss": 0,
+        "push": 0,
+        "no_market": 0,
+        "didnt_bet": 0,
+        "risked_units": 0,
+        "profit_units": 0,
+        "by_market": {},
+    }
+
+    for bet in load_training_bets():
+        recorded_at = parse_iso_datetime(bet.get("recorded_at"))
+        if recorded_at < cutoff:
+            continue
+        status = bet.get("status", "open")
+        market = normalize_market_name(bet.get("market") or bet.get("raw_market"))
+        summary["total"] += 1
+        summary[status] = summary.get(status, 0) + 1
+        item = summary["by_market"].setdefault(
+            market,
+            {
+                "total": 0,
+                "win": 0,
+                "loss": 0,
+                "push": 0,
+                "no_market": 0,
+                "didnt_bet": 0,
+                "risked_units": 0,
+                "profit_units": 0,
+            },
+        )
+        item["total"] += 1
+        if status in item:
+            item[status] += 1
+        if status in ["win", "loss"]:
+            stake = safe_float(bet.get("stake_units"), 1)
+            profit = safe_float(
+                bet.get("profit_units"),
+                units_for_result(status, bet.get("odds"), stake),
+            )
+            summary["risked_units"] += stake
+            summary["profit_units"] += profit
+            item["risked_units"] += stake
+            item["profit_units"] += profit
+
+    return summary
+
+
+def training_market_penalty(market):
+    if not AUTO_MARKET_PENALTIES or not market:
+        return 0
+
+    item = summarize_training_bets(days=30)["by_market"].get(normalize_market_name(market))
+    if not item:
+        return 0
+    graded = item["win"] + item["loss"]
+    if graded < MIN_TRAINING_BETS_PER_MARKET or item["risked_units"] <= 0:
+        return 0
+
+    roi = item["profit_units"] / item["risked_units"]
+    if roi < TRAINING_BAD_ROI_THRESHOLD:
+        return TRAINING_MARKET_PENALTY_POINTS
     return 0
 
 
@@ -665,26 +797,93 @@ def build_market_report(days=RESULTS_RECAP_DAYS):
     return "\n".join(lines)
 
 
+def build_training_report(days=30):
+    summary = summarize_training_bets(days)
+    if not summary["total"]:
+        return (
+            f"Training bets: last {days} day(s)\n\n"
+            "No training bets logged yet.\n\n"
+            "Example:\n"
+            "/trainbet win +340 1 Player Hits | Sam Antonacci 2+ hits"
+        )
+
+    graded = summary["win"] + summary["loss"]
+    win_rate = (summary["win"] / graded * 100) if graded else 0
+    roi = (
+        summary["profit_units"] / summary["risked_units"] * 100
+        if summary["risked_units"]
+        else 0
+    )
+
+    lines = [
+        f"Training bets: last {days} day(s)",
+        "",
+        f"Logged: {summary['total']}",
+        f"Record: {summary['win']}-{summary['loss']}-{summary['push']}",
+        f"No market: {summary['no_market']}",
+        f"Win rate: {win_rate:.1f}%" if graded else "Win rate: not enough graded bets",
+        f"Units: {summary['profit_units']:+.2f}",
+        f"ROI: {roi:.1f}%" if summary["risked_units"] else "ROI: not enough odds/results",
+    ]
+
+    if summary["by_market"]:
+        lines.extend(["", "By market:"])
+        for market, item in sorted(
+            summary["by_market"].items(),
+            key=lambda row: row[1]["total"],
+            reverse=True,
+        ):
+            market_graded = item["win"] + item["loss"]
+            market_win_rate = (item["win"] / market_graded * 100) if market_graded else 0
+            market_roi = (
+                item["profit_units"] / item["risked_units"] * 100
+                if item["risked_units"]
+                else 0
+            )
+            penalty = training_market_penalty(market)
+            line = f"{market}: {item['win']}-{item['loss']}-{item['push']}"
+            if market_graded:
+                line += f" | {market_win_rate:.1f}% win | {market_roi:+.1f}% ROI"
+            if penalty:
+                line += f" | penalty -{penalty}"
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+def parse_trainbet_args(args):
+    if len(args) < 4:
+        return None
+
+    outcome = SETTLE_CHOICES.get(args[0].lower())
+    odds = args[1]
+    stake = args[2]
+    rest = " ".join(args[3:])
+    market, _, note = rest.partition("|")
+    return outcome, odds, stake, market.strip(), note.strip()
+
+
 def market_performance_penalty(market):
     if not AUTO_MARKET_PENALTIES or not market:
         return 0
 
+    penalty = training_market_penalty(market)
     stats = build_market_stats(days=30)
     item = stats.get(market)
     if not item or item["sent"] < MARKET_AVAILABILITY_MIN_SAMPLE:
-        return 0
+        return penalty
 
     availability = item["available"] / item["sent"] if item["sent"] else 1
     if availability < LOW_MARKET_AVAILABILITY_RATE:
-        return MARKET_PENALTY_POINTS
+        penalty = max(penalty, MARKET_PENALTY_POINTS)
 
     graded = item["win"] + item["loss"]
     if graded >= MARKET_AVAILABILITY_MIN_SAMPLE:
         win_rate = item["win"] / graded
         if win_rate < SCORE_CALIBRATION_MIN_WIN_RATE:
-            return max(3, MARKET_PENALTY_POINTS // 2)
+            penalty = max(penalty, max(3, MARKET_PENALTY_POINTS // 2))
 
-    return 0
+    return penalty
 
 
 def score_calibration_penalty(score):
@@ -995,6 +1194,7 @@ def subscription_message():
         "/status - check status\n"
         "/recap - show recent alert results\n"
         "/markets - show market availability\n"
+        "/training - show settled bet training ROI\n"
         "/pending - show open tracked alerts\n"
         "/details ID - show alert breakdown\n"
         "Use the buttons under each alert to report results.\n"
@@ -1137,6 +1337,41 @@ def check_telegram_messages():
         elif command == "/markets":
             send_telegram(chat_id, build_market_report())
 
+        elif command in ["/training", "/trainreport"]:
+            send_telegram(chat_id, build_training_report())
+
+        elif command == "/trainbet":
+            parsed = parse_trainbet_args(args)
+            if not parsed or not parsed[0]:
+                send_telegram(
+                    chat_id,
+                    "Send result, odds, stake, and market.\n\n"
+                    "Example:\n"
+                    "/trainbet win +340 1 Player Hits | Sam Antonacci 2+ hits",
+                )
+                continue
+            outcome, odds, stake, market, note = parsed
+            bet = record_training_bet(
+                outcome,
+                odds,
+                stake=stake,
+                market=market,
+                note=note,
+                source=f"telegram:{chat_id}",
+            )
+            if not bet:
+                send_telegram(chat_id, "I couldn't log that training bet. Check the format.")
+                continue
+            send_telegram(
+                chat_id,
+                "Training bet logged.\n\n"
+                f"{bet['market']}\n"
+                f"Result: {bet['status']}\n"
+                f"Odds: {bet['odds']}\n"
+                f"Units: {safe_float(bet['profit_units']):+.2f}\n\n"
+                f"{build_training_report()}",
+            )
+
         elif command == "/pending":
             send_telegram(chat_id, build_pending_alerts())
 
@@ -1186,6 +1421,7 @@ def check_telegram_messages():
                 "Send /status to check status.\n"
                 "Send /recap to see results.\n"
                 "Send /markets to see market availability.\n"
+                "Send /training to see settled bet training ROI.\n"
                 "Send /pending to see open alerts.\n"
                 "Send /details ID to see alert breakdown.\n"
                 "Send /settle ID to quickly report a result.\n"

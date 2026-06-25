@@ -501,6 +501,44 @@ class ResultTrackingTests(unittest.TestCase):
                 self.assertIn("95+: 1-0-0", recap)
                 self.assertIn("#3: 100.0% win", recap)
 
+    def test_training_bet_normalizes_market_and_reports_roi(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bet_file = os.path.join(temp_dir, "bets.json")
+            with patch.object(main, "BET_HISTORY_FILE", bet_file):
+                bet = main.record_training_bet(
+                    "win",
+                    "+340",
+                    stake=1,
+                    market="Sam Antonacci to record 2+ hits",
+                    note="screenshot",
+                )
+                report = main.build_training_report(days=1)
+
+                self.assertEqual(bet["market"], "Player Hits")
+                self.assertAlmostEqual(bet["profit_units"], 3.4)
+                self.assertIn("Player Hits", report)
+                self.assertIn("ROI: 340.0%", report)
+
+    def test_training_market_penalty_uses_negative_roi(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bet_file = os.path.join(temp_dir, "bets.json")
+            with patch.object(main, "BET_HISTORY_FILE", bet_file):
+                with patch.object(main, "MIN_TRAINING_BETS_PER_MARKET", 2):
+                    main.record_training_bet("loss", "+600", stake=1, market="to hit a home run")
+                    main.record_training_bet("loss", "+1100", stake=1, market="home run")
+
+                    self.assertEqual(
+                        main.training_market_penalty("Player Home Run"),
+                        main.TRAINING_MARKET_PENALTY_POINTS,
+                    )
+
+    def test_trainbet_parser_accepts_note_separator(self):
+        parsed = main.parse_trainbet_args(
+            ["win", "+340", "1", "Player", "Hits", "|", "Sam", "Antonacci"]
+        )
+
+        self.assertEqual(parsed, ("win", "+340", "1", "Player Hits", "Sam Antonacci"))
+
 
 class LiveFeedParsingTests(unittest.TestCase):
     def test_get_current_pitcher_prefers_current_play_matchup(self):
